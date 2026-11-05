@@ -1,10 +1,15 @@
+use regex::Regex;
 use std::{
     io::Write,
     net::{IpAddr, Ipv4Addr},
 };
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use if_addrs::Interface;
 
+#[derive(Clone)]
 pub struct Config {
     interfaces: Vec<Interface>,
     ipv4_addr: IpAddr,
@@ -68,7 +73,7 @@ pub fn return_input() -> String {
     input
 }
 
-pub fn auth_user() -> () {
+pub fn edit_name() -> () {
     todo!()
 }
 
@@ -129,6 +134,74 @@ pub fn network_setup(config: &mut Config) -> () {
     }
 }
 
-pub async fn lan_connection(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn active_connection(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     todo!()
+}
+pub async fn passive_connection(
+    mut config_rx: watch::Receiver<Config>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut current_config = config_rx.borrow().clone();
+    let mut listener = TcpListener::bind(format!(
+        "{}:{}",
+        current_config.ipv4_addr, current_config.port
+    ))
+    .await?;
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((mut socket, _addr)) => {
+                        tokio::spawn(async move {
+                            let mut buffer = vec![0; 1024];
+                            match socket.read(&mut buffer).await {
+                                Ok(n) if n > 0 => {
+                                    let received_message = String::from_utf8_lossy(&buffer[..n]);
+                                    if received_message.contains("INVITE") {
+                                        let host_name = extract_brackets(&received_message)
+                                            .first()
+                                            .copied()
+                                            .unwrap_or("Unknown");
+                                        println!("[ALARM] Invite from user: {}", host_name);
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("Socket error: {e}"),
+                            }
+                        });
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            changed_result = config_rx.changed() => {
+                if changed_result.is_err() {
+                    break;
+                }
+                let new_config = config_rx.borrow().clone();
+
+                if new_config.ipv4_addr != current_config.ipv4_addr || new_config.port != current_config.port {
+                    current_config = new_config;
+
+                    match TcpListener::bind(format!("{}:{}", current_config.ipv4_addr, current_config.port)).await {
+                        Ok(new_listener) => {
+                            listener = new_listener;
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to rebind on new address/port: {}. Will keep trying...", e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_brackets(text: &str) -> Vec<&str> {
+    let re = Regex::new(r"<([^>]+)>").unwrap();
+
+    re.captures_iter(text)
+        .map(|cap| cap.get(1).unwrap().as_str())
+        .collect()
 }

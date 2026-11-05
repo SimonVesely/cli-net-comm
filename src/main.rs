@@ -1,8 +1,17 @@
+use tokio::sync::watch;
 use utils::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
+
+    let (config_tx, config_rx) = watch::channel(config.clone());
+
+    tokio::spawn(async move {
+        if let Err(e) = passive_connection(config_rx).await {
+            eprint!("Background listener error: {e}");
+        }
+    });
 
     'main: loop {
         display_status(&config);
@@ -13,9 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match input {
-            1 => auth_user(),
-            2 => network_setup(&mut config),
-            3 => lan_connection(&config).await?,
+            1 => edit_name(),
+            2 => {
+                network_setup(&mut config);
+                let _ = config_tx.send(config.clone());
+            }
+            3 => active_connection(&config).await?,
             _ => {
                 println!("\0\x1b[2J\x1b[HThanks for using this app!");
                 return Ok(());
