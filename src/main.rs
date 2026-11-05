@@ -10,7 +10,6 @@ struct Config {
     ipv4_addr: IpAddr,
     port: u16,
     username: String,
-    password: String,
 }
 
 impl Default for Config {
@@ -29,14 +28,13 @@ impl Default for Config {
             ipv4_addr: ip_addr,
             port: 52345,
             username: String::from("EMPTY"),
-            password: String::from(""),
         }
     }
 }
 
 fn display_status(config: &Config) -> () {
     println!(
-        "
+        "\0\x1b[2J\x1b[H
     ▗▄▄▖▗▖   ▗▄▄▄▖    ▗▖  ▗▖▗▄▄▄▖▗▄▄▄▖▗▖ ▗▖ ▗▄▖ ▗▄▄▖ ▗▖ ▗▖
    ▐▌   ▐▌     █      ▐▛▚▖▐▌▐▌     █  ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌▗▞▘
    ▐▌   ▐▌     █      ▐▌ ▝▜▌▐▛▀▀▘  █  ▐▌ ▐▌▐▌ ▐▌▐▛▀▚▖▐▛▚▖
@@ -76,7 +74,7 @@ fn auth_user() -> () {
 
 fn network_setup(config: &mut Config) -> () {
     'setup: loop {
-        println!("Actual IP and Port configuration: ");
+        println!("\0\x1b[2J\x1b[HActual IP and Port configuration: ");
         println!("IP: {:>6}", config.ipv4_addr);
         println!("Port: {:>6}", config.port);
         std::io::stdout()
@@ -92,7 +90,7 @@ fn network_setup(config: &mut Config) -> () {
 
         match input {
             1 => 'ip_addr: loop {
-                println!("Choose different network interface: ");
+                println!("\0\x1b[2J\x1b[HChoose different network interface: ");
                 for (index, int) in config.interfaces.iter().enumerate() {
                     println!("{} -> {}", index + 1, int.ip().to_string());
                 }
@@ -112,7 +110,7 @@ fn network_setup(config: &mut Config) -> () {
                 continue 'setup;
             },
             2 => 'port: loop {
-                println!("Choode different port: ");
+                println!("\0\x1b[2J\x1b[HChoose different port: ");
                 let new_port: u16 = match return_input().trim().parse::<u16>() {
                     Ok(val) => val,
                     Err(_) => continue 'port,
@@ -152,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             2 => network_setup(&mut config),
             3 => lan_connection(),
             _ => {
+                println!("\0\x1b[2J\x1b[HThanks for using this app!");
                 return Ok(());
             }
         }
