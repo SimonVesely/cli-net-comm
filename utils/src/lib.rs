@@ -3,7 +3,7 @@ pub mod discovery;
 use regex::Regex;
 use std::{
     io::Write,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -13,16 +13,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use if_addrs::Interface;
-
-pub use discovery::{OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
+pub use discovery::{DEFAULT_PORT, OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
 
 pub static ON_MAIN_SCREEN: AtomicBool = AtomicBool::new(false);
 static SCREEN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 pub struct Config {
-    interfaces: Vec<Interface>,
+    bind_options: Vec<IpAddr>,
     ipv4_addr: IpAddr,
     port: u16,
     username: String,
@@ -30,19 +28,22 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let interfaces: Vec<Interface> = if_addrs::get_if_addrs()
+        let mut bind_options: Vec<IpAddr> = if_addrs::get_if_addrs()
             .unwrap_or_default()
             .into_iter()
             .filter(|iface| !iface.is_loopback() && iface.ip().is_ipv4())
+            .map(|iface| iface.ip())
             .collect();
-        let ip_addr = interfaces
+        let ip_addr = bind_options
             .first()
-            .map(|interface| interface.ip())
-            .unwrap_or(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+            .copied()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        bind_options.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        bind_options.push(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         Config {
-            interfaces: interfaces,
+            bind_options,
             ipv4_addr: ip_addr,
-            port: 52345,
+            port: DEFAULT_PORT,
             username: String::from("EMPTY"),
         }
     }
@@ -69,7 +70,11 @@ pub fn display_status(config: &Config, online: &OnlineList) -> () {
     );
     println!("Your are now signed in as: {}", config.username);
     println!("Your setup configuration: ");
-    println!("IP: {:>6}", config.ipv4_addr);
+    println!(
+        "IP: {:>6}  {}",
+        config.ipv4_addr,
+        bind_label(&config.ipv4_addr)
+    );
     println!("Port: {:>6}", config.port);
 
     let peers = online.snapshot();
@@ -81,11 +86,11 @@ pub fn display_status(config: &Config, online: &OnlineList) -> () {
     if peers.is_empty() {
         println!("   nobody found yet (press r to scan)");
     }
-    for (ip, peer) in &peers {
+    for (addr, peer) in &peers {
         println!(
-            "   ● {:<16} {:<15}  seen {}s ago",
+            "   ● {:<16} {:<21}  seen {}s ago",
             peer.username,
-            ip,
+            addr,
             peer.last_seen.elapsed().as_secs()
         );
     }
@@ -149,21 +154,20 @@ pub fn network_setup(config: &mut Config) -> () {
         match input {
             1 => 'ip_addr: loop {
                 println!("\0\x1b[2J\x1b[HChoose different network interface: ");
-                for (index, int) in config.interfaces.iter().enumerate() {
-                    println!("{} -> {}", index + 1, int.ip().to_string());
+                for (index, ip) in config.bind_options.iter().enumerate() {
+                    println!("{} -> {} {}", index + 1, ip, bind_label(ip));
                 }
                 let new_addr: u8 = match return_input().trim().parse::<u8>() {
                     Ok(val) => val,
                     Err(_) => continue 'ip_addr,
                 };
                 match new_addr as usize {
-                    choice if choice <= config.interfaces.len() && choice != 0 => {
-                        let new_interface = config.interfaces[choice - 1].clone();
-                        config.ipv4_addr = new_interface.ip();
+                    choice if choice <= config.bind_options.len() && choice != 0 => {
+                        config.ipv4_addr = config.bind_options[choice - 1];
 
                         break;
                     }
-                    _ => println!("Invalid choice (1-{} available)", config.interfaces.len()),
+                    _ => println!("Invalid choice (1-{} available)", config.bind_options.len()),
                 }
                 continue 'setup;
             },
@@ -207,7 +211,10 @@ pub async fn passive_connection(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((mut socket, addr)) => {
-                        let my_name = config_rx.borrow().username.clone();
+                        let (my_name, my_port) = {
+                            let cfg = config_rx.borrow();
+                            (cfg.username.clone(), cfg.port)
+                        };
                         let online = online.clone();
 
                         tokio::spawn(async move {
@@ -216,12 +223,13 @@ pub async fn passive_connection(
                                 Ok(n) if n > 0 => {
                                     let received_message = String::from_utf8_lossy(&buffer[..n]);
 
-                                    if let Some(their_name) = parse_greeting(&received_message, "HELLO") {
+                                    if let Some((their_name, their_port)) = parse_greeting(&received_message, "HELLO") {
                                         let reply = format!("HI <{my_name}>\n");
                                         if let Err(e) = socket.write_all(reply.as_bytes()).await {
                                             eprintln!("Failed to answer HELLO: {e}");
                                         }
-                                        online.upsert(addr.ip(), their_name);
+                                        let their_addr = SocketAddr::new(addr.ip(), their_port.unwrap_or(my_port));
+                                        online.upsert(their_addr, their_name);
                                     } else if received_message.contains("INVITE") {
                                         let host_name = extract_brackets(&received_message)
                                             .first()
@@ -269,6 +277,16 @@ pub fn set_on_main_screen(value: bool) {
 
 pub fn is_on_main_screen() -> bool {
     ON_MAIN_SCREEN.load(Ordering::SeqCst)
+}
+
+fn bind_label(ip: &IpAddr) -> &'static str {
+    if ip.is_unspecified() {
+        "(all interfaces)"
+    } else if ip.is_loopback() {
+        "(loopback - this machine only)"
+    } else {
+        ""
+    }
 }
 
 fn extract_brackets(text: &str) -> Vec<&str> {
