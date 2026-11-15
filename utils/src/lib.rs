@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod discovery;
 
 use regex::Regex;
@@ -13,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+pub use chat::{Invites, active_connection, handle_pending_invite, is_in_chat};
 pub use discovery::{DEFAULT_PORT, OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
 
 pub static ON_MAIN_SCREEN: AtomicBool = AtomicBool::new(false);
@@ -49,7 +51,7 @@ impl Default for Config {
     }
 }
 
-pub fn display_status(config: &Config, online: &OnlineList) -> () {
+pub fn display_status(config: &Config, online: &OnlineList, invites: &Invites) -> () {
     let _guard = SCREEN_LOCK.lock().unwrap();
 
     println!(
@@ -58,8 +60,6 @@ pub fn display_status(config: &Config, online: &OnlineList) -> () {
    ▐▌   ▐▌     █      ▐▛▚▖▐▌▐▌     █  ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌▐▌▗▞▘
    ▐▌   ▐▌     █      ▐▌ ▝▜▌▐▛▀▀▘  █  ▐▌ ▐▌▐▌ ▐▌▐▛▀▚▖▐▛▚▖
    ▝▚▄▄▖▐▙▄▄▖▗▄█▄▖    ▐▌  ▐▌▐▙▄▄▖  █  ▐▙█▟▌▝▚▄▞▘▐▌ ▐▌▐▌ ▐▌
-
-
 
     ▗▄▄▖ ▗▄▖ ▗▖  ▗▖▗▖  ▗▖▗▖ ▗▖▗▖  ▗▖▗▄▄▄▖ ▗▄▄▖ ▗▄▖▗▄▄▄▖▗▄▖ ▗▄▄▖
    ▐▌   ▐▌ ▐▌▐▛▚▞▜▌▐▛▚▞▜▌▐▌ ▐▌▐▛▚▖▐▌  █  ▐▌   ▐▌ ▐▌ █ ▐▌ ▐▌▐▌ ▐▌
@@ -95,6 +95,10 @@ pub fn display_status(config: &Config, online: &OnlineList) -> () {
         );
     }
     println!("───────────────────────────────────────────────");
+    if let Some((from, addr)) = invites.peek() {
+        println!();
+        println!("   >>> Chat invite from {from} ({addr})  —  a -> accept, d -> decline");
+    }
     println!();
     println!("1 -> Edit name   2 -> Network setup   3 -> Connect");
     println!("r -> Refresh / scan LAN                q -> Quit");
@@ -191,13 +195,10 @@ pub fn network_setup(config: &mut Config) -> () {
     }
 }
 
-pub async fn active_connection(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    todo!()
-}
-
 pub async fn passive_connection(
     mut config_rx: watch::Receiver<Config>,
     online: OnlineList,
+    invites: Invites,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut current_config = config_rx.borrow().clone();
     let mut listener = TcpListener::bind(format!(
@@ -216,6 +217,7 @@ pub async fn passive_connection(
                             (cfg.username.clone(), cfg.port)
                         };
                         let online = online.clone();
+                        let invites = invites.clone();
 
                         tokio::spawn(async move {
                             let mut buffer = vec![0; 1024];
@@ -229,13 +231,24 @@ pub async fn passive_connection(
                                             eprintln!("Failed to answer HELLO: {e}");
                                         }
                                         let their_addr = SocketAddr::new(addr.ip(), their_port.unwrap_or(my_port));
-                                        online.upsert(their_addr, their_name);
-                                    } else if received_message.contains("INVITE") {
+                                        online.upsert(their_addr, their_name, false);
+                                    } else if received_message.starts_with("INVITE") {
                                         let host_name = extract_brackets(&received_message)
                                             .first()
-                                            .copied()
-                                            .unwrap_or("Unknown");
-                                        println!("[ALARM] Invite from user: {}", host_name);
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| "Unknown".into());
+
+                                        let rejected = if is_in_chat() {
+                                            Some(socket)
+                                        } else {
+                                            invites.offer(host_name, addr, socket).err()
+                                        };
+                                        match rejected {
+                                            Some(mut socket) => {
+                                                let _ = socket.write_all(b"BUSY\n").await;
+                                            }
+                                            None => online.touch(),
+                                        }
                                     }
                                 }
                                 Ok(_) => {}

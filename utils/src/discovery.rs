@@ -27,6 +27,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub username: String,
+    pub addr: SocketAddr,
+    pub verified: bool,
     pub last_seen: Instant,
 }
 
@@ -47,15 +49,22 @@ impl Default for OnlineList {
 }
 
 impl OnlineList {
-    pub fn upsert(&self, addr: SocketAddr, username: String) {
-        let addr = canonical(addr, &local_ips());
+    pub fn upsert(&self, addr: SocketAddr, username: String, verified: bool) {
+        let key = canonical(addr, &local_ips());
 
         let mut peers = self.peers.lock().unwrap();
-        let is_new_or_renamed = peers.get(&addr).is_none_or(|p| p.username != username);
+        let old = peers.get(&key);
+        let is_new_or_renamed = old.is_none_or(|p| p.username != username);
+        let (addr, verified) = match old {
+            Some(p) if p.verified && !verified => (p.addr, true),
+            _ => (addr, verified),
+        };
         peers.insert(
-            addr,
+            key,
             Peer {
                 username,
+                addr,
+                verified,
                 last_seen: Instant::now(),
             },
         );
@@ -81,11 +90,15 @@ impl OnlineList {
             .peers
             .lock()
             .unwrap()
-            .iter()
-            .map(|(addr, p)| (*addr, p.clone()))
+            .values()
+            .map(|p| (p.addr, p.clone()))
             .collect();
         list.sort_by_key(|(addr, _)| *addr);
         list
+    }
+
+    pub fn touch(&self) {
+        self.changed.send_modify(|v| *v += 1);
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -117,7 +130,6 @@ fn canonical(addr: SocketAddr, locals: &[IpAddr]) -> SocketAddr {
 pub async fn arp_neighbours() -> Vec<Ipv4Addr> {
     match Command::new("arp").arg("-an").output().await {
         Ok(out) => parse_arp(&String::from_utf8_lossy(&out.stdout)),
-        // Silent: printing here would land in the middle of the menu screen.
         Err(_) => Vec::new(),
     }
 }
@@ -186,7 +198,7 @@ pub async fn scan_lan(config: Config, online: OnlineList) {
 
     while let Some(result) = tasks.join_next().await {
         if let Ok(Some((addr, name))) = result {
-            online.upsert(addr, name);
+            online.upsert(addr, name, true);
         }
     }
 }

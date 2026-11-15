@@ -7,6 +7,7 @@ use utils::*;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
     let online = OnlineList::default();
+    let invites = Invites::default();
     let scan_now = Arc::new(Notify::new());
 
     let (config_tx, config_rx) = watch::channel(config.clone());
@@ -14,8 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let config_rx = config_rx.clone();
         let online = online.clone();
+        let invites = invites.clone();
         tokio::spawn(async move {
-            if let Err(e) = passive_connection(config_rx, online).await {
+            if let Err(e) = passive_connection(config_rx, online, invites).await {
                 eprint!("Background listener error: {e}");
             }
         });
@@ -41,21 +43,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let config_rx = config_rx.clone();
         let online = online.clone();
+        let invites = invites.clone();
         let mut changes = online.subscribe();
         tokio::spawn(async move {
             while changes.changed().await.is_ok() {
                 if is_on_main_screen() {
                     let cfg = config_rx.borrow().clone();
-                    display_status(&cfg, &online);
+                    display_status(&cfg, &online, &invites);
                 }
             }
         });
     }
 
     'main: loop {
-        display_status(&config, &online);
+        display_status(&config, &online, &invites);
         set_on_main_screen(true);
-        let input = return_input();
+        let input = tokio::task::block_in_place(return_input);
         set_on_main_screen(false);
 
         match input.trim() {
@@ -67,7 +70,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 network_setup(&mut config);
                 let _ = config_tx.send(config.clone());
             }
-            "3" => active_connection(&config).await?,
+            "3" => active_connection(&config, &online).await,
+            "a" | "A" => handle_pending_invite(&config, &invites, true).await,
+            "d" | "D" => handle_pending_invite(&config, &invites, false).await,
             "r" | "R" => {
                 scan_now.notify_one();
             }
