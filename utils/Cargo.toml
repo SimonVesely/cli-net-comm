@@ -13,3 +13,4 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 ring = "0.17"
 futures-util.workspace = true
 tokio-tungstenite.workspace = true
+webpki-roots = "1"

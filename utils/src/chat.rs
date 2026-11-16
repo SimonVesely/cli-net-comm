@@ -9,12 +9,18 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::timeout,
 };
 
-use crate::{Config, OnlineList, discovery::local_ips, extract_brackets, return_input, tls};
+use crate::{
+    Config, OnlineList,
+    discovery::local_ips,
+    extract_brackets,
+    relay::{self, RelayAddr, RelayError, RelayState},
+    return_input, tls,
+};
 
 pub const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -29,10 +35,15 @@ fn set_in_chat(value: bool) {
     IN_CHAT.store(value, Ordering::SeqCst);
 }
 
+pub enum InviteSource {
+    Lan(TcpStream),
+    Relay { addr: RelayAddr, id: u64 },
+}
+
 pub struct PendingInvite {
     pub from: String,
-    pub addr: SocketAddr,
-    pub stream: TcpStream,
+    pub origin: String,
+    pub source: InviteSource,
     received: Instant,
 }
 
@@ -45,30 +56,30 @@ impl Invites {
     pub fn offer(
         &self,
         from: String,
-        addr: SocketAddr,
-        stream: TcpStream,
-    ) -> Result<(), TcpStream> {
+        origin: String,
+        source: InviteSource,
+    ) -> Result<(), InviteSource> {
         let mut slot = self.slot.lock().unwrap();
         if slot
             .as_ref()
             .is_some_and(|p| p.received.elapsed() < INVITE_TIMEOUT)
         {
-            return Err(stream);
+            return Err(source);
         }
         *slot = Some(PendingInvite {
             from,
-            addr,
-            stream,
+            origin,
+            source,
             received: Instant::now(),
         });
         Ok(())
     }
 
-    pub fn peek(&self) -> Option<(String, SocketAddr)> {
+    pub fn peek(&self) -> Option<(String, String)> {
         let slot = self.slot.lock().unwrap();
         slot.as_ref()
             .filter(|p| p.received.elapsed() < INVITE_TIMEOUT)
-            .map(|p| (p.from.clone(), p.addr))
+            .map(|p| (p.from.clone(), p.origin.clone()))
     }
 
     pub fn take(&self) -> Option<PendingInvite> {
@@ -80,27 +91,18 @@ impl Invites {
     }
 }
 
-pub enum InviteResult {
-    Accepted(TcpStream, String),
+pub enum InviteResult<S> {
+    Accepted(S, String),
     Declined,
     Busy,
     NoAnswer,
     Unreachable(String),
 }
 
-pub async fn send_invite(addr: SocketAddr, my_name: &str) -> InviteResult {
-    let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return InviteResult::Unreachable(e.to_string()),
-        Err(_) => return InviteResult::Unreachable("connect timed out".into()),
-    };
-    if let Err(e) = stream
-        .write_all(format!("INVITE <{my_name}>\n").as_bytes())
-        .await
-    {
-        return InviteResult::Unreachable(e.to_string());
-    }
-
+pub async fn await_answer<S>(mut stream: S) -> InviteResult<S>
+where
+    S: AsyncRead + Unpin,
+{
     let line = match timeout(INVITE_TIMEOUT, read_line_raw(&mut stream)).await {
         Ok(Some(line)) => line,
         Ok(None) => return InviteResult::Declined,
@@ -120,7 +122,22 @@ pub async fn send_invite(addr: SocketAddr, my_name: &str) -> InviteResult {
     }
 }
 
-async fn invite_with_fallback(addr: SocketAddr, my_name: &str) -> InviteResult {
+pub async fn send_invite(addr: SocketAddr, my_name: &str) -> InviteResult<TcpStream> {
+    let mut stream = match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return InviteResult::Unreachable(e.to_string()),
+        Err(_) => return InviteResult::Unreachable("connect timed out".into()),
+    };
+    if let Err(e) = stream
+        .write_all(format!("INVITE <{my_name}>\n").as_bytes())
+        .await
+    {
+        return InviteResult::Unreachable(e.to_string());
+    }
+    await_answer(stream).await
+}
+
+async fn invite_with_fallback(addr: SocketAddr, my_name: &str) -> InviteResult<TcpStream> {
     let locals = local_ips();
     let mut candidates = vec![addr];
     if locals.contains(&addr.ip()) {
@@ -142,8 +159,22 @@ async fn invite_with_fallback(addr: SocketAddr, my_name: &str) -> InviteResult {
     last
 }
 
-async fn read_line_raw(stream: &mut TcpStream) -> Option<String> {
-    use tokio::io::AsyncReadExt;
+async fn invite_via_relay(
+    addr: &RelayAddr,
+    my_name: &str,
+    to: &str,
+) -> InviteResult<relay::RelayStream> {
+    match relay::connect(addr, my_name, to).await {
+        Ok(stream) => await_answer(stream).await,
+        Err(RelayError::Status(404)) => InviteResult::Unreachable("not online on relay".into()),
+        Err(e) => InviteResult::Unreachable(e.to_string()),
+    }
+}
+
+pub async fn read_line_raw<S>(stream: &mut S) -> Option<String>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -159,27 +190,17 @@ async fn read_line_raw(stream: &mut TcpStream) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
-pub async fn answer_invite(
-    invite: PendingInvite,
-    my_name: &str,
-    accept: bool,
-) -> Option<(TcpStream, String)> {
-    let mut stream = invite.stream;
-    let reply = if accept {
-        format!("ACCEPT <{my_name}>\n")
-    } else {
-        "DECLINE\n".to_string()
-    };
-    let sent = stream.write_all(reply.as_bytes()).await.is_ok();
-    (accept && sent).then_some((stream, invite.from))
-}
-
 fn read_line_blocking() -> String {
     tokio::task::block_in_place(return_input)
 }
 
 fn flush() {
     let _ = std::io::stdout().flush();
+}
+
+fn pause(msg: &str) {
+    println!("{msg} Press Enter to go back.");
+    read_line_blocking();
 }
 
 pub async fn chat_session<S>(stream: S, peer: String, fingerprint: String)
@@ -243,72 +264,137 @@ where
     set_in_chat(false);
 }
 
-pub async fn active_connection(config: &Config, online: &OnlineList) {
-    let peers = online.snapshot();
+async fn finish_invite<S>(result: InviteResult<S>, peer: &str)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let msg = match result {
+        InviteResult::Accepted(stream, name) => match tls::connect(stream).await {
+            Ok((tls, fingerprint)) => return chat_session(tls, name, fingerprint).await,
+            Err(e) => format!("TLS handshake with {name} failed: {e}."),
+        },
+        InviteResult::Declined => format!("{peer} declined."),
+        InviteResult::Busy => format!("{peer} is busy in another chat."),
+        InviteResult::NoAnswer => format!("{peer} didn't answer."),
+        InviteResult::Unreachable(e) => format!("Couldn't reach {peer}: {e}."),
+    };
+    pause(&msg);
+}
+
+async fn accept_and_chat<S>(stream: S, peer: String)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match tls::accept(stream).await {
+        Ok((tls, fingerprint)) => chat_session(tls, peer, fingerprint).await,
+        Err(e) => {
+            print!("\x1b[2J\x1b[H");
+            pause(&format!("TLS handshake with {peer} failed: {e}."));
+        }
+    }
+}
+
+enum Target {
+    Lan(SocketAddr, String),
+    Relay(RelayAddr, String),
+}
+
+pub async fn active_connection(config: &Config, online: &OnlineList, relay_state: &RelayState) {
+    let mut targets: Vec<Target> = online
+        .snapshot()
+        .into_iter()
+        .map(|(addr, peer)| Target::Lan(addr, peer.username))
+        .collect();
+    if let Some(relay_addr) = &config.relay {
+        targets.extend(
+            relay_state
+                .users()
+                .into_iter()
+                .map(|name| Target::Relay(relay_addr.clone(), name)),
+        );
+    }
 
     print!("\x1b[2J\x1b[H");
-    if peers.is_empty() {
-        println!("Nobody online yet. Press Enter to go back.");
-        read_line_blocking();
+    if targets.is_empty() {
+        pause("Nobody online yet.");
         return;
     }
 
     println!("Who do you want to chat with? (Enter = back)\n");
-    for (i, (addr, peer)) in peers.iter().enumerate() {
-        println!("{} -> {:<16} {}", i + 1, peer.username, addr);
+    for (i, target) in targets.iter().enumerate() {
+        match target {
+            Target::Lan(addr, name) => println!("{} -> {:<16} {}", i + 1, name, addr),
+            Target::Relay(_, name) => println!("{} -> {:<16} [relay]", i + 1, name),
+        }
     }
     print!("\n> ");
     flush();
 
     let choice = match read_line_blocking().trim().parse::<usize>() {
-        Ok(n) if (1..=peers.len()).contains(&n) => n,
+        Ok(n) if (1..=targets.len()).contains(&n) => n,
         _ => return,
     };
-    let (addr, peer) = &peers[choice - 1];
 
     set_in_chat(true);
-    println!(
-        "Inviting {} at {}… waiting up to {}s for them to accept.",
-        peer.username,
-        addr,
-        INVITE_TIMEOUT.as_secs()
-    );
-    flush();
-    let result = invite_with_fallback(*addr, &config.username).await;
-    set_in_chat(false);
-
-    let msg = match result {
-        InviteResult::Accepted(stream, name) => match tls::connect(stream).await {
-            Ok((tls, fingerprint)) => return chat_session(tls, name, fingerprint).await,
-            Err(e) => format!("TLS handshake with {name} failed: {e}"),
-        },
-        InviteResult::Declined => format!("{} declined.", peer.username),
-        InviteResult::Busy => format!("{} is busy in another chat.", peer.username),
-        InviteResult::NoAnswer => format!("{} didn't answer.", peer.username),
-        InviteResult::Unreachable(e) => format!("Couldn't reach {}: {e}", peer.username),
-    };
-    println!("{msg} Press Enter to go back.");
-    read_line_blocking();
+    match &targets[choice - 1] {
+        Target::Lan(addr, name) => {
+            println!(
+                "Inviting {name} at {addr}… waiting up to {}s for them to accept.",
+                INVITE_TIMEOUT.as_secs()
+            );
+            flush();
+            let result = invite_with_fallback(*addr, &config.username).await;
+            set_in_chat(false);
+            finish_invite(result, name).await;
+        }
+        Target::Relay(relay_addr, name) => {
+            println!(
+                "Inviting {name} via relay… waiting up to {}s for them to accept.",
+                INVITE_TIMEOUT.as_secs()
+            );
+            flush();
+            let result = invite_via_relay(relay_addr, &config.username, name).await;
+            set_in_chat(false);
+            finish_invite(result, name).await;
+        }
+    }
 }
 
 pub async fn handle_pending_invite(config: &Config, invites: &Invites, accept: bool) {
     let Some(invite) = invites.take() else {
         return;
     };
-    match answer_invite(invite, &config.username, accept).await {
-        Some((stream, name)) => match tls::accept(stream).await {
-            Ok((tls, fingerprint)) => chat_session(tls, name, fingerprint).await,
-            Err(e) => {
-                println!(
-                    "\x1b[2J\x1b[HTLS handshake with {name} failed: {e}. Press Enter to go back."
-                );
-                read_line_blocking();
+    let PendingInvite { from, source, .. } = invite;
+
+    match source {
+        InviteSource::Lan(mut stream) => {
+            let reply = if accept {
+                format!("ACCEPT <{}>\n", config.username)
+            } else {
+                "DECLINE\n".to_string()
+            };
+            let sent = stream.write_all(reply.as_bytes()).await.is_ok();
+            if accept && sent {
+                accept_and_chat(stream, from).await;
+            } else if accept {
+                print!("\x1b[2J\x1b[H");
+                pause("The invite expired.");
             }
-        },
-        None if accept => {
-            println!("\x1b[2J\x1b[HThe invite expired. Press Enter to go back.");
-            read_line_blocking();
         }
-        None => {}
+        InviteSource::Relay { addr, id } if accept => {
+            print!("\x1b[2J\x1b[H");
+            println!("Joining {from} via relay…");
+            flush();
+            match relay::join(&addr, id, &config.username).await {
+                Ok(stream) => accept_and_chat(stream, from).await,
+                Err(e) => pause(&format!("Couldn't join {from}: {e}.")),
+            }
+        }
+        InviteSource::Relay { addr, id } => {
+            let name = config.username.clone();
+            tokio::spawn(async move {
+                let _ = relay::decline(&addr, id, &name).await;
+            });
+        }
     }
 }

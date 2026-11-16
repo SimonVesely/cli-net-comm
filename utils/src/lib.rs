@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod discovery;
+pub mod relay;
 pub mod tls;
 pub mod ws;
 
@@ -16,8 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-pub use chat::{Invites, active_connection, handle_pending_invite, is_in_chat};
+pub use chat::{InviteSource, Invites, active_connection, handle_pending_invite, is_in_chat};
 pub use discovery::{DEFAULT_PORT, OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
+pub use relay::{DEFAULT_RELAY, RelayAddr, RelayState};
 
 pub static ON_MAIN_SCREEN: AtomicBool = AtomicBool::new(false);
 static SCREEN_LOCK: Mutex<()> = Mutex::new(());
@@ -28,6 +30,7 @@ pub struct Config {
     ipv4_addr: IpAddr,
     port: u16,
     username: String,
+    relay: Option<RelayAddr>,
 }
 
 impl Default for Config {
@@ -49,11 +52,17 @@ impl Default for Config {
             ipv4_addr: ip_addr,
             port: DEFAULT_PORT,
             username: String::from("EMPTY"),
+            relay: RelayAddr::parse(DEFAULT_RELAY),
         }
     }
 }
 
-pub fn display_status(config: &Config, online: &OnlineList, invites: &Invites) -> () {
+pub fn display_status(
+    config: &Config,
+    online: &OnlineList,
+    invites: &Invites,
+    relay: &RelayState,
+) -> () {
     let _guard = SCREEN_LOCK.lock().unwrap();
 
     println!(
@@ -97,6 +106,21 @@ pub fn display_status(config: &Config, online: &OnlineList, invites: &Invites) -
         );
     }
     println!("───────────────────────────────────────────────");
+    match &config.relay {
+        Some(addr) => {
+            let users = relay.users();
+            println!();
+            println!("── Relay {addr} — {}", relay.status());
+            if users.is_empty() {
+                println!("   nobody else online on relay");
+            }
+            for name in &users {
+                println!("   ● {name}");
+            }
+            println!("───────────────────────────────────────────────");
+        }
+        None => println!("Relay: off"),
+    }
     if let Some((from, addr)) = invites.peek() {
         println!();
         println!("   >>> Chat invite from {from} ({addr})  —  a -> accept, d -> decline");
@@ -145,12 +169,14 @@ pub fn network_setup(config: &mut Config) -> () {
         println!("\0\x1b[2J\x1b[HActual IP and Port configuration: ");
         println!("IP: {:>6}", config.ipv4_addr);
         println!("Port: {:>6}", config.port);
+        println!("Relay: {}", relay_label(config));
         std::io::stdout()
             .flush()
             .expect("Should flush terminal screen.");
         println!("Want to change interface: 1");
         println!("Want to change port: 2");
-        println!("Back to main screen: 3");
+        println!("Want to change relay server: 3");
+        println!("Back to main screen: 4");
 
         let input = match return_input().trim().parse::<u8>() {
             Ok(val) => val,
@@ -186,12 +212,37 @@ pub fn network_setup(config: &mut Config) -> () {
                 config.port = new_port;
                 continue 'setup;
             },
-            3 => {
+            3 => 'relay: loop {
+                println!("\0\x1b[2J\x1b[HCurrent relay: {}", relay_label(config));
+                println!(
+                    "Enter relay URL (e.g. {DEFAULT_RELAY}), '-' to turn relay off, empty to keep: "
+                );
+                let input = return_input();
+                match input.trim() {
+                    "" => continue 'setup,
+                    "-" => {
+                        config.relay = None;
+                        continue 'setup;
+                    }
+                    url => match RelayAddr::parse(url) {
+                        Some(addr) => {
+                            config.relay = Some(addr);
+                            continue 'setup;
+                        }
+                        None => {
+                            println!("Invalid URL. Press Enter to try again.");
+                            return_input();
+                            continue 'relay;
+                        }
+                    },
+                }
+            },
+            4 => {
                 print!("Exiting network setup");
                 return ();
             }
             _ => {
-                println!("Invalid choice (1-3 available)");
+                println!("Invalid choice (1-4 available)");
             }
         }
     }
@@ -240,16 +291,16 @@ pub async fn passive_connection(
                                             .map(|s| s.to_string())
                                             .unwrap_or_else(|| "Unknown".into());
 
-                                        let rejected = if is_in_chat() {
-                                            Some(socket)
+                                        if is_in_chat() {
+                                            let _ = socket.write_all(b"BUSY\n").await;
                                         } else {
-                                            invites.offer(host_name, addr, socket).err()
-                                        };
-                                        match rejected {
-                                            Some(mut socket) => {
-                                                let _ = socket.write_all(b"BUSY\n").await;
+                                            match invites.offer(host_name, addr.to_string(), InviteSource::Lan(socket)) {
+                                                Ok(()) => online.touch(),
+                                                Err(InviteSource::Lan(mut socket)) => {
+                                                    let _ = socket.write_all(b"BUSY\n").await;
+                                                }
+                                                Err(_) => {}
                                             }
-                                            None => online.touch(),
                                         }
                                     }
                                 }
@@ -292,6 +343,13 @@ pub fn set_on_main_screen(value: bool) {
 
 pub fn is_on_main_screen() -> bool {
     ON_MAIN_SCREEN.load(Ordering::SeqCst)
+}
+
+fn relay_label(config: &Config) -> String {
+    config
+        .relay
+        .as_ref()
+        .map_or_else(|| "off".to_string(), |addr| addr.to_string())
 }
 
 fn bind_label(ip: &IpAddr) -> &'static str {
