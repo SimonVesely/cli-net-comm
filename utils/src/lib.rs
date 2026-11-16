@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod discovery;
 pub mod tls;
+pub mod ws;
 
 use regex::Regex;
 use std::{

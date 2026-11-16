@@ -10,7 +10,10 @@ use rustls::{
     crypto::{CryptoProvider, ring as ring_provider},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    time::timeout,
+};
 use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 
 const SERVER_NAME: &str = "cli-net-comm";
@@ -122,7 +125,10 @@ fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")
 }
 
-pub async fn connect(stream: TcpStream) -> io::Result<(client::TlsStream<TcpStream>, String)> {
+pub async fn connect<S>(stream: S) -> io::Result<(client::TlsStream<S>, String)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let connector = TlsConnector::from(client_config());
     let name = ServerName::try_from(SERVER_NAME).expect("valid server name");
     let tls = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
@@ -139,7 +145,10 @@ pub async fn connect(stream: TcpStream) -> io::Result<(client::TlsStream<TcpStre
     Ok((tls, peer_fp))
 }
 
-pub async fn accept(stream: TcpStream) -> io::Result<(server::TlsStream<TcpStream>, String)> {
+pub async fn accept<S>(stream: S) -> io::Result<(server::TlsStream<S>, String)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let id = identity();
     let acceptor = TlsAcceptor::from(id.server_config.clone());
     let tls = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))

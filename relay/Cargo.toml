@@ -1,0 +1,13 @@
+[package]
+name = "relay"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+futures-util.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+
+[dev-dependencies]
+utils.workspace = true
+tokio-tungstenite.workspace = true

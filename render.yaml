@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: cli-net-comm-relay
+    runtime: rust
+    plan: free
+    region: frankfurt
+    buildCommand: cargo build --release -p relay
+    startCommand: ./target/release/relay
+    healthCheckPath: /healthz
+    buildFilter:
+      paths:
+        - relay/**
+        - Cargo.toml
+        - Cargo.lock
