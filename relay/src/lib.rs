@@ -26,6 +26,7 @@ use tokio::{
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const FERRIS_PNG: &[u8] = include_bytes!("../assets/ferris.png");
+const LOGO_SVG: &str = include_str!("../assets/logo-dark.svg");
 
 const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -78,6 +79,7 @@ pub fn app() -> Router {
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .route("/ferris.png", get(ferris))
+        .route("/logo.svg", get(logo))
         .route("/status", get(status))
         .route("/healthz", get(|| async { "ok" }))
         .route("/users", get(users))
@@ -121,6 +123,16 @@ async fn ferris() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         FERRIS_PNG,
+    )
+}
+
+async fn logo() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        LOGO_SVG,
     )
 }
 

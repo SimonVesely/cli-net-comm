@@ -69,6 +69,8 @@
   @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgba(60, 207, 145, 0); } 100% { box-shadow: 0 0 0 0 rgba(60, 207, 145, 0); } }
 
   main { max-width: 1120px; margin: 0 auto; padding: 48px 32px 160px; }
+  .hero { display: grid; grid-template-columns: 1fr auto; gap: 48px; align-items: center; }
+  .hero-logo { width: 300px; height: auto; display: block; }
   h1 { font-size: 40px; line-height: 1.15; font-weight: 600; letter-spacing: -0.02em; margin: 0 0 12px; }
   .lede { color: var(--muted); font-size: 18px; max-width: 720px; margin: 0; }
   .badge {
@@ -114,13 +116,6 @@
   .empty { padding: 40px 32px; text-align: center; color: var(--muted); }
   .empty strong { display: block; color: var(--text); font-size: 18px; margin-bottom: 6px; }
 
-  table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 14px 32px; border-bottom: 1px solid var(--border); vertical-align: top; }
-  tr:last-child td { border-bottom: 0; }
-  th { color: var(--muted); font-weight: 500; font-size: 14px; }
-  td code { font-family: var(--mono); font-size: 14px; color: var(--text); }
-  .method { font-family: var(--mono); font-size: 12px; color: var(--accent); border: 1px solid var(--border-strong); padding: 1px 6px; margin-right: 8px; }
-  td.desc { color: var(--muted); }
 
   footer { color: var(--faint); font-size: 14px; margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); }
 
@@ -134,6 +129,8 @@
   @keyframes wave { 25% { transform: rotate(-8deg); } 75% { transform: rotate(8deg); } }
 
   @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; gap: 24px; }
+    .hero-logo { order: -1; width: 240px; }
     .stats { grid-template-columns: repeat(2, 1fr); }
     .steps { grid-template-columns: 1fr; }
   }
@@ -147,9 +144,8 @@
     .card { padding: 20px; }
     .card.users { padding: 0; }
     .stat-value { font-size: 28px; }
-    .users-head, .users li, .empty, th, td { padding-left: 16px; padding-right: 16px; }
+    .users-head, .users li, .empty { padding-left: 16px; padding-right: 16px; }
     .users-head { flex-direction: column; align-items: flex-start; }
-    .hide-sm { display: none; }
     .ferris { width: 72px; right: 10px; bottom: 8px; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -167,8 +163,13 @@
 </header>
 
 <main>
+  <section class="hero">
+  <div>
   <h1>cli-net-comm relay <span class="badge">TLS 1.3 end-to-end</span></h1>
   <p class="lede">Meeting point for the cli-net-comm terminal chat. Clients behind NAT connect here over WebSocket, find each other and get paired. The chat itself is encrypted between the two clients, so this server only forwards ciphertext.</p>
+  </div>
+  <img class="hero-logo" src="/logo.svg" alt="cli-net-comm logo: A and B linked through an encrypted relay" width="392" height="278">
+  </section>
 
   <div class="grid stats">
     <div class="card"><div class="stat-label">Online users</div><div class="stat-value" id="stat-users">–</div></div>
@@ -200,21 +201,6 @@
     </div>
   </div>
 
-  <h2>Endpoints</h2>
-  <div class="card users">
-    <table>
-      <thead><tr><th>Route</th><th class="hide-sm">Purpose</th></tr></thead>
-      <tbody>
-        <tr><td><span class="method">WS</span><code>/listen?name=…</code></td><td class="desc hide-sm">Stay online and receive invites</td></tr>
-        <tr><td><span class="method">WS</span><code>/connect?from=…&amp;to=…</code></td><td class="desc hide-sm">Invite a user, then chat</td></tr>
-        <tr><td><span class="method">WS</span><code>/join/{id}?name=…</code></td><td class="desc hide-sm">Accept an invite</td></tr>
-        <tr><td><span class="method">GET</span><code>/decline/{id}?name=…</code></td><td class="desc hide-sm">Decline an invite</td></tr>
-        <tr><td><span class="method">GET</span><a href="/users"><code>/users</code></a></td><td class="desc hide-sm">Online names, one per line</td></tr>
-        <tr><td><span class="method">GET</span><a href="/status"><code>/status</code></a></td><td class="desc hide-sm">Live numbers for this page (JSON)</td></tr>
-        <tr><td><span class="method">GET</span><a href="/healthz"><code>/healthz</code></a></td><td class="desc hide-sm">Health check</td></tr>
-      </tbody>
-    </table>
-  </div>
 
   <footer>Built with Rust, axum and rustls · Hosted on Render · <a href="https://github.com/SimonVesely/cli-net-comm">Source on GitHub</a></footer>
 </main>
