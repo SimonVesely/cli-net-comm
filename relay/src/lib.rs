@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -14,8 +14,8 @@ use axum::{
         Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    http::{StatusCode, header},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -23,6 +23,9 @@ use tokio::{
     sync::mpsc,
     time::{Instant, Interval, interval_at},
 };
+
+const INDEX_HTML: &str = include_str!("../assets/index.html");
+const FERRIS_PNG: &[u8] = include_bytes!("../assets/ferris.png");
 
 const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -34,17 +37,48 @@ struct Pending {
     inviter: WebSocket,
 }
 
-#[derive(Default)]
 struct Relay {
     listeners: Mutex<HashMap<String, mpsc::UnboundedSender<String>>>,
     pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
+    active_chats: AtomicUsize,
+    started: Instant,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self {
+            listeners: Mutex::default(),
+            pending: Mutex::default(),
+            next_id: AtomicU64::default(),
+            active_chats: AtomicUsize::default(),
+            started: Instant::now(),
+        }
+    }
+}
+
+struct ChatGuard<'a>(&'a AtomicUsize);
+
+impl<'a> ChatGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for ChatGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 type Shared = Arc<Relay>;
 
 pub fn app() -> Router {
     Router::new()
+        .route("/", get(|| async { Html(INDEX_HTML) }))
+        .route("/ferris.png", get(ferris))
+        .route("/status", get(status))
         .route("/healthz", get(|| async { "ok" }))
         .route("/users", get(users))
         .route("/listen", get(listen))
@@ -70,10 +104,59 @@ fn line(text: String) -> Message {
     Message::Binary(Bytes::from(text))
 }
 
-async fn users(State(relay): State<Shared>) -> String {
+fn online_names(relay: &Relay) -> Vec<String> {
     let mut names: Vec<String> = relay.listeners.lock().unwrap().keys().cloned().collect();
     names.sort();
-    names.into_iter().map(|n| n + "\n").collect()
+    names
+}
+
+async fn users(State(relay): State<Shared>) -> String {
+    online_names(&relay).into_iter().map(|n| n + "\n").collect()
+}
+
+async fn ferris() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FERRIS_PNG,
+    )
+}
+
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+async fn status(State(relay): State<Shared>) -> impl IntoResponse {
+    let users: Vec<String> = online_names(&relay)
+        .iter()
+        .map(|n| json_string(n))
+        .collect();
+    let body = format!(
+        "{{\"users\":[{}],\"active_chats\":{},\"pending_invites\":{},\"uptime_secs\":{}}}",
+        users.join(","),
+        relay.active_chats.load(Ordering::Relaxed),
+        relay.pending.lock().unwrap().len(),
+        relay.started.elapsed().as_secs()
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
 }
 
 async fn listen(State(relay): State<Shared>, q: Params, ws: WebSocketUpgrade) -> Response {
@@ -178,6 +261,7 @@ async fn join(
         {
             return;
         }
+        let _chat = ChatGuard::new(&relay.active_chats);
         pipe(inviter, invitee).await;
     })
 }
