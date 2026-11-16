@@ -9,12 +9,12 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::timeout,
 };
 
-use crate::{Config, OnlineList, discovery::local_ips, extract_brackets, return_input};
+use crate::{Config, OnlineList, discovery::local_ips, extract_brackets, return_input, tls};
 
 pub const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -182,12 +182,16 @@ fn flush() {
     let _ = std::io::stdout().flush();
 }
 
-pub async fn chat_session(stream: TcpStream, peer: String) {
+pub async fn chat_session<S>(stream: S, peer: String, fingerprint: String)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     set_in_chat(true);
     print!("\x1b[2J\x1b[H");
-    println!("── Chat with {peer} ── (UNENCRYPTED, type /quit to leave)\n");
+    println!("── Chat with {peer} ── (TLS 1.3, type /quit to leave)");
+    println!("Fingerprint: {fingerprint}  (must match on {peer}'s screen)\n");
 
-    let (rd, mut wr) = stream.into_split();
+    let (rd, mut wr) = tokio::io::split(stream);
     let peer_gone = Arc::new(AtomicBool::new(false));
 
     let reader = {
@@ -219,23 +223,22 @@ pub async fn chat_session(stream: TcpStream, peer: String) {
         let text = input.trim_end_matches(['\r', '\n']);
         if text == "/quit" {
             let _ = wr.write_all(b"BYE\n").await;
+            let _ = wr.flush().await;
             break;
         }
         if text.trim().is_empty() {
             continue;
         }
         print!("\x1b[1A\r\x1b[2Kyou: {text}\n");
-        if wr
-            .write_all(format!("MSG {text}\n").as_bytes())
-            .await
-            .is_err()
-        {
+        let sent = wr.write_all(format!("MSG {text}\n").as_bytes()).await;
+        if sent.is_err() || wr.flush().await.is_err() {
             println!("[connection lost — press Enter]");
             read_line_blocking();
             break;
         }
     }
 
+    let _ = wr.shutdown().await;
     reader.abort();
     set_in_chat(false);
 }
@@ -275,7 +278,10 @@ pub async fn active_connection(config: &Config, online: &OnlineList) {
     set_in_chat(false);
 
     let msg = match result {
-        InviteResult::Accepted(stream, name) => return chat_session(stream, name).await,
+        InviteResult::Accepted(stream, name) => match tls::connect(stream).await {
+            Ok((tls, fingerprint)) => return chat_session(tls, name, fingerprint).await,
+            Err(e) => format!("TLS handshake with {name} failed: {e}"),
+        },
         InviteResult::Declined => format!("{} declined.", peer.username),
         InviteResult::Busy => format!("{} is busy in another chat.", peer.username),
         InviteResult::NoAnswer => format!("{} didn't answer.", peer.username),
@@ -290,7 +296,15 @@ pub async fn handle_pending_invite(config: &Config, invites: &Invites, accept: b
         return;
     };
     match answer_invite(invite, &config.username, accept).await {
-        Some((stream, name)) => chat_session(stream, name).await,
+        Some((stream, name)) => match tls::accept(stream).await {
+            Ok((tls, fingerprint)) => chat_session(tls, name, fingerprint).await,
+            Err(e) => {
+                println!(
+                    "\x1b[2J\x1b[HTLS handshake with {name} failed: {e}. Press Enter to go back."
+                );
+                read_line_blocking();
+            }
+        },
         None if accept => {
             println!("\x1b[2J\x1b[HThe invite expired. Press Enter to go back.");
             read_line_blocking();
