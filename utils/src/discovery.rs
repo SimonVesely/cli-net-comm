@@ -19,7 +19,7 @@ use crate::{Config, extract_brackets};
 
 pub const DEFAULT_PORT: u16 = 52345;
 const LOCAL_PORT_SPAN: u16 = 10;
-pub const SCAN_INTERVAL: Duration = Duration::from_secs(30);
+pub const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_TTL: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);

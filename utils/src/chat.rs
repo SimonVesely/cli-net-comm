@@ -210,7 +210,7 @@ where
     set_in_chat(true);
     print!("\x1b[2J\x1b[H");
     println!("── Chat with {peer} ── (TLS 1.3, type /quit to leave)");
-    println!("Fingerprint: {fingerprint}  (must match on {peer}'s screen)\n");
+    println!("Fingerprint: {fingerprint}\n");
 
     let (rd, mut wr) = tokio::io::split(stream);
     let peer_gone = Arc::new(AtomicBool::new(false));
