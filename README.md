@@ -47,6 +47,7 @@ A secure command-line interface (CLI) application written in **Rust** for encryp
 
 ### Prerequisites
 * [Rust & Cargo](https://www.rust-lang.org/) installed on your machine.
+* Strongly recommend using a [Nerd Font](https://www.nerdfonts.com/font-downloads) — the TUI relies on special icons and characters that won't render properly without one.
 
 ### 1. Clone the Repository
 ```bash
