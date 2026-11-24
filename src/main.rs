@@ -47,17 +47,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let config_rx = config_rx.clone();
+        let mut config_rx = config_rx.clone();
         let online = online.clone();
         let scan_now = scan_now.clone();
         tokio::spawn(async move {
             loop {
-                let cfg = config_rx.borrow().clone();
-                scan_lan(cfg, online.clone()).await;
+                let cfg = config_rx.borrow_and_update().clone();
+                if cfg.has_name() {
+                    scan_lan(cfg, online.clone()).await;
+                } else {
+                    online.clear();
+                }
 
                 tokio::select! {
                     _ = tokio::time::sleep(SCAN_INTERVAL) => {}
                     _ = scan_now.notified() => {}
+                    changed = config_rx.changed() => if changed.is_err() { break },
                 }
             }
         });

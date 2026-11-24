@@ -60,17 +60,24 @@ enum Popup {
 
 struct NameForm {
     input: TextInput,
+    hint: &'static str,
     error: Option<&'static str>,
 }
 
 impl NameForm {
     fn new(config: &Config) -> Self {
-        let current = match config.username() {
-            "EMPTY" => "",
-            name => name,
+        Self::with_hint(config, "Others see this name on the LAN and on the relay.")
+    }
+
+    fn with_hint(config: &Config, hint: &'static str) -> Self {
+        let current = if config.has_name() {
+            config.username()
+        } else {
+            ""
         };
         Self {
             input: TextInput::new(current),
+            hint,
             error: None,
         }
     }
@@ -239,6 +246,12 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
             KeyCode::Char('d') => handle_pending_invite(&app.config, &app.invites, false).await,
             KeyCode::Char('1') => popup = Some(Popup::Name(NameForm::new(&app.config))),
             KeyCode::Char('2') => popup = Some(Popup::Network(NetworkForm::new(&app.config))),
+            KeyCode::Char('3') if !app.config.has_name() => {
+                popup = Some(Popup::Name(NameForm::with_hint(
+                    &app.config,
+                    "Set a name first. Until then you stay hidden.",
+                )));
+            }
             KeyCode::Char('3') => {
                 suspend()?;
                 active_connection(&app.config, &app.online, &app.relay_state).await;
@@ -343,10 +356,7 @@ fn draw_name_popup(frame: &mut Frame, form: &NameForm) {
         Constraint::Length(1),
     ])
     .areas(inner);
-    frame.render_widget(
-        Paragraph::new("Others see this name on the LAN and on the relay.").fg(MUTED),
-        hint,
-    );
+    frame.render_widget(Paragraph::new(form.hint).fg(MUTED), hint);
     form.input.render(frame, input, field("name", true), true);
     frame.render_widget(error_line(form.error), error);
 }
@@ -429,7 +439,11 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(vec![
             label("name   "),
-            Span::from(cfg.username().to_string()).bold(),
+            if cfg.has_name() {
+                Span::from(cfg.username().to_string()).bold()
+            } else {
+                Span::from("not set · hidden").fg(WARN).bold()
+            },
         ]),
         Line::from(vec![
             label("listen "),
@@ -457,13 +471,18 @@ fn draw_lan(frame: &mut Frame, area: Rect, app: &App) {
     let block = panel(format!("LAN · {}", peers.len()));
 
     if peers.is_empty() {
+        let (what, key, action) = if app.config.has_name() {
+            ("nobody found yet", "r", " to scan")
+        } else {
+            ("you are hidden until you set a name", "1", " to set it")
+        };
         let text = Paragraph::new(vec![
             Line::default(),
-            Line::from("nobody found yet").fg(MUTED),
+            Line::from(what).fg(MUTED),
             Line::from(vec![
                 Span::from("press ").fg(MUTED),
-                Span::from("r").fg(ACCENT).bold(),
-                Span::from(" to scan").fg(MUTED),
+                Span::from(key).fg(ACCENT).bold(),
+                Span::from(action).fg(MUTED),
             ]),
         ])
         .alignment(Alignment::Center)
@@ -506,6 +525,7 @@ fn draw_relay(frame: &mut Frame, area: Rect, app: &App) {
         RelayStatus::Connecting => ("◌", WARN),
         RelayStatus::Error(_) => ("●", ERR),
         RelayStatus::Off => ("○", MUTED),
+        RelayStatus::NeedsName => ("○", WARN),
     };
     let users = app.relay_state.users();
     let block = panel(format!("Relay · {}", users.len()));

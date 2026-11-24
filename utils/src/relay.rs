@@ -267,6 +267,7 @@ pub async fn decline(addr: &RelayAddr, id: u64, name: &str) -> Result<(), RelayE
 pub enum RelayStatus {
     #[default]
     Off,
+    NeedsName,
     Connecting,
     Online,
     Error(String),
@@ -276,6 +277,7 @@ impl fmt::Display for RelayStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RelayStatus::Off => write!(f, "off"),
+            RelayStatus::NeedsName => write!(f, "waiting for you to set a name"),
             RelayStatus::Connecting => {
                 write!(f, "connecting… (free Render may need ~1 min to wake)")
             }
@@ -342,6 +344,15 @@ pub async fn run(
             }
             continue;
         };
+
+        if !cfg.has_name() {
+            state.set_users(Vec::new(), &online);
+            state.set_status(RelayStatus::NeedsName, &online);
+            if config_rx.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
 
         state.set_status(RelayStatus::Connecting, &online);
         let path = format!("/listen?name={}", enc(&cfg.username));
@@ -466,4 +477,3 @@ fn handle_line(line: &str, addr: &RelayAddr, me: &str, online: &OnlineList, invi
         });
     }
 }
-

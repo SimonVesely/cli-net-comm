@@ -97,6 +97,16 @@ impl OnlineList {
         list
     }
 
+    pub fn clear(&self) {
+        let mut peers = self.peers.lock().unwrap();
+        if peers.is_empty() {
+            return;
+        }
+        peers.clear();
+        drop(peers);
+        self.changed.send_modify(|v| *v += 1);
+    }
+
     pub fn touch(&self) {
         self.changed.send_modify(|v| *v += 1);
     }

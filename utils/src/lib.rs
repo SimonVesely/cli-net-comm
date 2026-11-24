@@ -21,6 +21,8 @@ pub use chat::{InviteSource, Invites, active_connection, handle_pending_invite, 
 pub use discovery::{DEFAULT_PORT, OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
 pub use relay::{DEFAULT_RELAY, RelayAddr, RelayState};
 
+pub const DEFAULT_USERNAME: &str = "EMPTY";
+
 pub static ON_MAIN_SCREEN: AtomicBool = AtomicBool::new(false);
 static SCREEN_LOCK: Mutex<()> = Mutex::new(());
 
@@ -51,7 +53,7 @@ impl Default for Config {
             bind_options,
             ipv4_addr: ip_addr,
             port: DEFAULT_PORT,
-            username: String::from("EMPTY"),
+            username: String::from(DEFAULT_USERNAME),
             relay: RelayAddr::parse(DEFAULT_RELAY),
         }
     }
@@ -60,6 +62,10 @@ impl Default for Config {
 impl Config {
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    pub fn has_name(&self) -> bool {
+        self.username != DEFAULT_USERNAME
     }
 
     pub fn ip(&self) -> IpAddr {
@@ -308,14 +314,17 @@ pub async fn passive_connection(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((mut socket, addr)) => {
-                        let (my_name, my_port) = {
+                        let (my_name, my_port, has_name) = {
                             let cfg = config_rx.borrow();
-                            (cfg.username.clone(), cfg.port)
+                            (cfg.username.clone(), cfg.port, cfg.has_name())
                         };
                         let online = online.clone();
                         let invites = invites.clone();
 
                         tokio::spawn(async move {
+                            if !has_name {
+                                return;
+                            }
                             let mut buffer = vec![0; 1024];
                             match socket.read(&mut buffer).await {
                                 Ok(n) if n > 0 => {
