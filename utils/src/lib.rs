@@ -73,6 +73,37 @@ impl Config {
     pub fn relay(&self) -> Option<&RelayAddr> {
         self.relay.as_ref()
     }
+
+    pub fn bind_options(&self) -> &[IpAddr] {
+        &self.bind_options
+    }
+
+    pub fn set_username(&mut self, name: &str) -> Result<(), &'static str> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("name can't be empty");
+        }
+        if name.contains(['<', '>']) {
+            return Err("name can't contain '<' or '>'");
+        }
+        if name.chars().count() > 32 {
+            return Err("name can have at most 32 characters");
+        }
+        self.username = name.to_string();
+        Ok(())
+    }
+
+    pub fn set_ip(&mut self, ip: IpAddr) {
+        self.ipv4_addr = ip;
+    }
+
+    pub fn set_port(&mut self, port: u16) {
+        self.port = port;
+    }
+
+    pub fn set_relay(&mut self, relay: Option<RelayAddr>) {
+        self.relay = relay;
+    }
 }
 
 pub fn display_status(

@@ -1,3 +1,4 @@
+mod input;
 mod tui;
 
 use std::sync::{Arc, Mutex};
