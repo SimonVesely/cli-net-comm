@@ -1,15 +1,18 @@
-use std::sync::Arc;
+mod tui;
+
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, watch};
 use utils::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = Config::default();
+    let config = Config::default();
     let online = OnlineList::default();
     let invites = Invites::default();
     let relay_state = RelayState::default();
     let scan_now = Arc::new(Notify::new());
+    let listener_error = Arc::new(Mutex::new(None));
 
     let (config_tx, config_rx) = watch::channel(config.clone());
 
@@ -17,9 +20,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config_rx = config_rx.clone();
         let online = online.clone();
         let invites = invites.clone();
+        let listener_error = listener_error.clone();
         tokio::spawn(async move {
-            if let Err(e) = passive_connection(config_rx, online, invites).await {
-                eprint!("Background listener error: {e}");
+            let mut changes = config_rx.clone();
+            loop {
+                changes.borrow_and_update();
+                *listener_error.lock().unwrap() = None;
+                match passive_connection(config_rx.clone(), online.clone(), invites.clone()).await {
+                    Ok(()) => break,
+                    Err(e) => *listener_error.lock().unwrap() = Some(format!("listener: {e}")),
+                }
+                if changes.changed().await.is_err() {
+                    break;
+                }
             }
         });
     }
@@ -49,48 +62,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    {
-        let config_rx = config_rx.clone();
-        let online = online.clone();
-        let invites = invites.clone();
-        let relay_state = relay_state.clone();
-        let mut changes = online.subscribe();
-        tokio::spawn(async move {
-            while changes.changed().await.is_ok() {
-                if is_on_main_screen() {
-                    let cfg = config_rx.borrow().clone();
-                    display_status(&cfg, &online, &invites, &relay_state);
-                }
-            }
-        });
-    }
-
-    'main: loop {
-        display_status(&config, &online, &invites, &relay_state);
-        set_on_main_screen(true);
-        let input = tokio::task::block_in_place(return_input);
-        set_on_main_screen(false);
-
-        match input.trim() {
-            "1" => {
-                edit_name(&mut config);
-                let _ = config_tx.send(config.clone());
-            }
-            "2" => {
-                network_setup(&mut config);
-                let _ = config_tx.send(config.clone());
-            }
-            "3" => active_connection(&config, &online, &relay_state).await,
-            "a" | "A" => handle_pending_invite(&config, &invites, true).await,
-            "d" | "D" => handle_pending_invite(&config, &invites, false).await,
-            "r" | "R" => {
-                scan_now.notify_one();
-            }
-            "q" | "Q" => {
-                println!("\0\x1b[2J\x1b[HThanks for using this app!");
-                return Ok(());
-            }
-            _ => continue 'main,
-        }
-    }
+    tui::run(tui::App {
+        config,
+        config_tx,
+        online,
+        invites,
+        relay_state,
+        scan_now,
+        listener_error,
+    })
+    .await?;
+    Ok(())
 }

@@ -57,6 +57,24 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn ip(&self) -> IpAddr {
+        self.ipv4_addr
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn relay(&self) -> Option<&RelayAddr> {
+        self.relay.as_ref()
+    }
+}
+
 pub fn display_status(
     config: &Config,
     online: &OnlineList,
@@ -274,9 +292,7 @@ pub async fn passive_connection(
 
                                     if let Some((their_name, their_port)) = parse_greeting(&received_message, "HELLO") {
                                         let reply = format!("HI <{my_name}>\n");
-                                        if let Err(e) = socket.write_all(reply.as_bytes()).await {
-                                            eprintln!("Failed to answer HELLO: {e}");
-                                        }
+                                        let _ = socket.write_all(reply.as_bytes()).await;
                                         let their_addr = SocketAddr::new(addr.ip(), their_port.unwrap_or(my_port));
                                         online.upsert(their_addr, their_name, false);
                                     } else if received_message.starts_with("INVITE") {
@@ -299,7 +315,7 @@ pub async fn passive_connection(
                                     }
                                 }
                                 Ok(_) => {}
-                                Err(e) => eprintln!("Socket error: {e}"),
+                                Err(_) => {}
                             }
                         });
                     }
@@ -320,9 +336,7 @@ pub async fn passive_connection(
                         Ok(new_listener) => {
                             listener = new_listener;
                         }
-                        Err(e) => {
-                            eprintln!("Failed to rebind on new address/port: {}. Will keep trying...", e);
-                        }
+                        Err(e) => return Err(e.into()),
                     }
                 }
             }

@@ -20,3 +20,4 @@ edition.workspace = true
 [dependencies]
 tokio.workspace = true
 utils.workspace = true
+ratatui = "0.30"
