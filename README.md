@@ -29,9 +29,16 @@ A secure command-line interface (CLI) application written in **Rust** for encryp
 
 ---
 
+## Terminal User Interface made with RataTUI
+<p align="center">
+  <img src="assets/main-menu-preview.png" alt="RataTUI Terminal User Interface" width="900">
+</p>
+
+---
+
 ## Architecture
 
-1. **CLI Client (Rust):** User application for encrypting, sending, receiving, and decrypting messages.
+1. **CLI Client (Rust + Ratatui):** User application for encrypting, sending, receiving, and decrypting messages.
 2. **Server (Rust + Axum):** Central relay node facilitating message transfer when peers are behind NATs or on separate networks.
 
 ---
