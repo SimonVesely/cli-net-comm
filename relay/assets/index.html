@@ -93,30 +93,6 @@
   .stat-label { color: var(--muted); font-size: 14px; }
   .stat-value { font-size: 36px; font-weight: 600; letter-spacing: -0.02em; margin-top: 6px; font-variant-numeric: tabular-nums; }
 
-  .users { padding: 0; }
-  .users-head {
-    display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px 16px;
-    padding: 20px 32px; border-bottom: 1px solid var(--border);
-    color: var(--muted); font-size: 14px;
-  }
-  .users ul { list-style: none; margin: 0; padding: 0; }
-  .users li {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 16px 32px; border-bottom: 1px solid var(--border);
-  }
-  .users li:last-child { border-bottom: 0; }
-  .user { display: flex; align-items: center; gap: 14px; font-weight: 500; }
-  .avatar {
-    width: 32px; height: 32px; display: grid; place-items: center;
-    background: var(--badge-bg); color: var(--badge-text);
-    font-size: 14px; font-weight: 600;
-  }
-  .state { color: var(--muted); font-size: 14px; display: flex; align-items: center; gap: 8px; }
-  .state .dot { animation: none; }
-  .empty { padding: 40px 32px; text-align: center; color: var(--muted); }
-  .empty strong { display: block; color: var(--text); font-size: 18px; margin-bottom: 6px; }
-
-
   footer { color: var(--faint); font-size: 14px; margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); }
 
   .ferris {
@@ -142,10 +118,7 @@
     .badge { margin: 8px 0 0; display: table; }
     .stats { gap: 12px; }
     .card { padding: 20px; }
-    .card.users { padding: 0; }
     .stat-value { font-size: 28px; }
-    .users-head, .users li, .empty { padding-left: 16px; padding-right: 16px; }
-    .users-head { flex-direction: column; align-items: flex-start; }
     .ferris { width: 72px; right: 10px; bottom: 8px; }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -178,19 +151,11 @@
     <div class="card"><div class="stat-label">Uptime</div><div class="stat-value" id="stat-uptime">–</div></div>
   </div>
 
-  <h2>Online users</h2>
-  <div class="card users">
-    <div class="users-head"><span>Connected to <code id="host"></code></span><span id="updated">Updating…</span></div>
-    <ul id="user-list"></ul>
-    <div class="empty" id="empty" hidden><strong>No one is online right now</strong>Start the cli-net-comm client and it will show up here.</div>
-    <div class="empty" id="private" hidden><strong id="private-count"></strong>Names stay private. Only people connected with the cli-net-comm client can see who is online.</div>
-  </div>
-
   <h2>How it works</h2>
   <div class="grid steps">
     <div class="card">
       <h3><span class="hex"><span>1</span></span>Listen</h3>
-      <p>The client opens a WebSocket to <code>/listen</code> under its name and appears in the list above.</p>
+      <p>The client opens a WebSocket to <code>/listen</code> under its name and counts as online.</p>
     </div>
     <div class="card">
       <h3><span class="hex"><span>2</span></span>Invite</h3>
@@ -210,8 +175,6 @@
 
 <script>
   const $ = (id) => document.getElementById(id);
-  $("host").textContent = location.host;
-
   function uptime(s) {
     const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
     if (d) return d + "d " + h + "h";
@@ -225,28 +188,6 @@
     $("stat-chats").textContent = data.active_chats;
     $("stat-invites").textContent = data.pending_invites;
     $("stat-uptime").textContent = uptime(data.uptime_secs);
-
-    const list = $("user-list");
-    const names = Array.isArray(data.users) ? data.users : null;
-    $("private").hidden = names !== null || data.online === 0;
-    $("private-count").textContent = data.online === 1 ? "1 person is online" : data.online + " people are online";
-    list.replaceChildren(...(names || []).map((name) => {
-      const li = document.createElement("li");
-      const user = document.createElement("span");
-      user.className = "user";
-      const avatar = document.createElement("span");
-      avatar.className = "avatar";
-      avatar.textContent = [...name][0].toUpperCase();
-      const label = document.createElement("span");
-      label.textContent = name;
-      user.append(avatar, label);
-      const state = document.createElement("span");
-      state.className = "state";
-      state.innerHTML = '<span class="dot"></span>Listening';
-      li.append(user, state);
-      return li;
-    }));
-    $("empty").hidden = data.online > 0;
   }
 
   function setLive(ok) {
@@ -260,10 +201,8 @@
       if (!res.ok) throw new Error(res.status);
       render(await res.json());
       setLive(true);
-      $("updated").textContent = "Updated " + new Date().toLocaleTimeString();
     } catch {
       setLive(false);
-      $("updated").textContent = "Retrying…";
     }
   }
 
