@@ -42,7 +42,11 @@ pub fn set_in_chat(value: bool) {
 
 pub enum InviteSource {
     Lan(TcpStream),
-    Relay { addr: RelayAddr, id: u64 },
+    Relay {
+        addr: RelayAddr,
+        token: String,
+        session: String,
+    },
 }
 
 pub struct PendingInvite {
@@ -168,10 +172,14 @@ async fn invite_via_relay(
     addr: &RelayAddr,
     my_name: &str,
     to: &str,
+    session: &str,
 ) -> InviteResult<relay::RelayStream> {
-    match relay::connect(addr, my_name, to).await {
+    match relay::connect(addr, my_name, to, session).await {
         Ok(stream) => await_answer(stream).await,
         Err(RelayError::Status(404)) => InviteResult::Unreachable("not online on relay".into()),
+        Err(RelayError::Status(429)) => {
+            InviteResult::Unreachable("too many invites, try again in a minute".into())
+        }
         Err(e) => InviteResult::Unreachable(e.to_string()),
     }
 }
@@ -344,8 +352,14 @@ pub async fn invite_relay(
     relay_addr: &RelayAddr,
     my_name: &str,
     peer: &str,
+    session: Option<String>,
 ) -> Result<Connected, String> {
-    finish_invite(invite_via_relay(relay_addr, my_name, peer).await, peer).await
+    let session = session.ok_or("Not connected to the relay yet.")?;
+    finish_invite(
+        invite_via_relay(relay_addr, my_name, peer, &session).await,
+        peer,
+    )
+    .await
 }
 
 pub async fn accept_invite(invite: PendingInvite, my_name: &str) -> Result<Connected, String> {
@@ -358,8 +372,12 @@ pub async fn accept_invite(invite: PendingInvite, my_name: &str) -> Result<Conne
                 .map_err(|_| "The invite expired.".to_string())?;
             accept_tls(stream, from).await
         }
-        InviteSource::Relay { addr, id } => {
-            let stream = relay::join(&addr, id, my_name)
+        InviteSource::Relay {
+            addr,
+            token,
+            session,
+        } => {
+            let stream = relay::join(&addr, &token, my_name, &session)
                 .await
                 .map_err(|e| format!("Couldn't join {from}: {e}."))?;
             accept_tls(stream, from).await
@@ -372,8 +390,12 @@ pub async fn decline_invite(invite: PendingInvite, my_name: &str) {
         InviteSource::Lan(mut stream) => {
             let _ = stream.write_all(b"DECLINE\n").await;
         }
-        InviteSource::Relay { addr, id } => {
-            let _ = relay::decline(&addr, id, my_name).await;
+        InviteSource::Relay {
+            addr,
+            token,
+            session,
+        } => {
+            let _ = relay::decline(&addr, &token, my_name, &session).await;
         }
     }
 }

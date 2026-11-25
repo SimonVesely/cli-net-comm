@@ -7,6 +7,11 @@ services:
     buildCommand: cargo build --release -p relay
     startCommand: ./target/release/relay
     healthCheckPath: /healthz
+    envVars:
+      - key: TRUST_PROXY
+        value: "true"
+      - key: PUBLIC_USERS
+        value: "false"
     buildFilter:
       paths:
         - relay/**

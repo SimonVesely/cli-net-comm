@@ -9,11 +9,18 @@ async fn main() -> std::io::Result<()> {
             .parse()
             .expect("RELAY_ADDR must be ip:port"),
     };
+    let settings = relay::Settings::from_env();
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("relay listening on {}", listener.local_addr()?);
-    axum::serve(listener, relay::app())
-        .with_graceful_shutdown(shutdown())
-        .await
+    println!(
+        "relay listening on {} (trust_proxy={}, public_users={})",
+        listener.local_addr()?,
+        settings.trust_proxy,
+        settings.public_users
+    );
+    tokio::select! {
+        result = relay::serve(listener, settings) => result,
+        _ = shutdown() => Ok(()),
+    }
 }
 
 async fn shutdown() {

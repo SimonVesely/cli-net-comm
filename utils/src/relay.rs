@@ -10,12 +10,12 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::watch,
-    time::{Instant, interval, interval_at, sleep, timeout},
+    time::{Instant, interval_at, sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-    tungstenite::{Bytes, Error as WsError, Message},
+    tungstenite::{Bytes, Error as WsError, Message, client::IntoClientRequest, http::HeaderValue},
 };
 
 use crate::{
@@ -29,7 +29,8 @@ pub const DEFAULT_RELAY: &str = "https://cli-net-comm-relay.onrender.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(90);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 const KEEPALIVE: Duration = Duration::from_secs(25);
-const USERS_POLL: Duration = Duration::from_secs(20);
+const MAX_HTTP_RESPONSE: u64 = 64 * 1024;
+const SESSION_HEADER: &str = "x-session";
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 pub type RelayStream = WsBytes<MaybeTlsStream<TcpStream>>;
@@ -143,13 +144,17 @@ fn tls_config() -> Arc<ClientConfig> {
         .clone()
 }
 
-async fn open_ws(addr: &RelayAddr, path: &str) -> Result<Ws, RelayError> {
-    let connect = connect_async_tls_with_config(
-        addr.ws_url(path),
-        None,
-        false,
-        Some(Connector::Rustls(tls_config())),
-    );
+async fn open_ws(addr: &RelayAddr, path: &str, session: Option<&str>) -> Result<Ws, RelayError> {
+    let mut request = addr
+        .ws_url(path)
+        .into_client_request()
+        .map_err(|e| RelayError::Other(e.to_string()))?;
+    if let Some(session) = session {
+        let value = HeaderValue::from_str(session).map_err(|e| RelayError::Other(e.to_string()))?;
+        request.headers_mut().insert(SESSION_HEADER, value);
+    }
+    let connect =
+        connect_async_tls_with_config(request, None, false, Some(Connector::Rustls(tls_config())));
     match timeout(CONNECT_TIMEOUT, connect).await {
         Err(_) => Err(RelayError::Other("relay did not answer in time".into())),
         Ok(Err(WsError::Http(resp))) => Err(RelayError::Status(resp.status().as_u16())),
@@ -165,7 +170,7 @@ where
     stream.write_all(request.as_bytes()).await?;
     stream.flush().await?;
     let mut raw = Vec::new();
-    match stream.read_to_end(&mut raw).await {
+    match stream.take(MAX_HTTP_RESPONSE).read_to_end(&mut raw).await {
         Ok(_) => Ok(raw),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && !raw.is_empty() => Ok(raw),
         Err(e) => Err(e),
@@ -210,9 +215,13 @@ fn parse_http(raw: &[u8]) -> Result<(u16, String), RelayError> {
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
-async fn http_get(addr: &RelayAddr, path: &str) -> Result<(u16, String), RelayError> {
+async fn http_get(
+    addr: &RelayAddr,
+    path: &str,
+    session: &str,
+) -> Result<(u16, String), RelayError> {
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cli-net-comm\r\nConnection: close\r\n\r\n",
+        "GET {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: cli-net-comm\r\n{SESSION_HEADER}: {session}\r\nConnection: close\r\n\r\n",
         addr.host
     );
     let fetch = async {
@@ -232,31 +241,34 @@ async fn http_get(addr: &RelayAddr, path: &str) -> Result<(u16, String), RelayEr
     parse_http(&raw)
 }
 
-pub async fn users(addr: &RelayAddr) -> Result<Vec<String>, RelayError> {
-    let (status, body) = http_get(addr, "/users").await?;
-    if status != 200 {
-        return Err(RelayError::Status(status));
-    }
-    Ok(body
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect())
-}
-
-pub async fn connect(addr: &RelayAddr, from: &str, to: &str) -> Result<RelayStream, RelayError> {
+pub async fn connect(
+    addr: &RelayAddr,
+    from: &str,
+    to: &str,
+    session: &str,
+) -> Result<RelayStream, RelayError> {
     let path = format!("/connect?from={}&to={}", enc(from), enc(to));
-    open_ws(addr, &path).await.map(WsBytes::new)
+    open_ws(addr, &path, Some(session)).await.map(WsBytes::new)
 }
 
-pub async fn join(addr: &RelayAddr, id: u64, name: &str) -> Result<RelayStream, RelayError> {
-    let path = format!("/join/{id}?name={}", enc(name));
-    open_ws(addr, &path).await.map(WsBytes::new)
+pub async fn join(
+    addr: &RelayAddr,
+    token: &str,
+    name: &str,
+    session: &str,
+) -> Result<RelayStream, RelayError> {
+    let path = format!("/join/{}?name={}", enc(token), enc(name));
+    open_ws(addr, &path, Some(session)).await.map(WsBytes::new)
 }
 
-pub async fn decline(addr: &RelayAddr, id: u64, name: &str) -> Result<(), RelayError> {
-    let (status, _) = http_get(addr, &format!("/decline/{id}?name={}", enc(name))).await?;
+pub async fn decline(
+    addr: &RelayAddr,
+    token: &str,
+    name: &str,
+    session: &str,
+) -> Result<(), RelayError> {
+    let path = format!("/decline/{}?name={}", enc(token), enc(name));
+    let (status, _) = http_get(addr, &path, session).await?;
     match status {
         200..=299 => Ok(()),
         code => Err(RelayError::Status(code)),
@@ -291,6 +303,7 @@ impl fmt::Display for RelayStatus {
 struct StateInner {
     status: RelayStatus,
     users: Vec<String>,
+    session: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -305,6 +318,14 @@ impl RelayState {
 
     pub fn users(&self) -> Vec<String> {
         self.inner.lock().unwrap().users.clone()
+    }
+
+    pub fn session(&self) -> Option<String> {
+        self.inner.lock().unwrap().session.clone()
+    }
+
+    fn set_session(&self, session: Option<String>) {
+        self.inner.lock().unwrap().session = session;
     }
 
     fn set_status(&self, status: RelayStatus, online: &OnlineList) {
@@ -356,7 +377,7 @@ pub async fn run(
 
         state.set_status(RelayStatus::Connecting, &online);
         let path = format!("/listen?name={}", enc(&cfg.username));
-        match open_ws(&addr, &path).await {
+        match open_ws(&addr, &path, None).await {
             Ok(ws) => {
                 backoff = Duration::from_secs(2);
                 state.set_status(RelayStatus::Online, &online);
@@ -370,6 +391,7 @@ pub async fn run(
                     &state,
                 )
                 .await;
+                state.set_session(None);
                 state.set_users(Vec::new(), &online);
                 match ended {
                     SessionEnd::ConfigChanged => continue,
@@ -405,7 +427,6 @@ async fn session(
 ) -> SessionEnd {
     let (mut sink, mut stream) = ws.split();
     let mut keepalive = interval_at(Instant::now() + KEEPALIVE, KEEPALIVE);
-    let mut poll = interval(USERS_POLL);
     let mut pending = String::new();
 
     loop {
@@ -421,24 +442,18 @@ async fn session(
                     Some(Err(e)) => return SessionEnd::Lost(e.to_string()),
                 };
                 pending.push_str(&String::from_utf8_lossy(&data));
+                if pending.len() > MAX_HTTP_RESPONSE as usize {
+                    return SessionEnd::Lost("relay sent an oversized message".into());
+                }
                 while let Some(end) = pending.find('\n') {
                     let line: String = pending.drain(..=end).collect();
-                    handle_line(line.trim(), addr, me, online, invites);
+                    handle_line(line.trim(), addr, me, online, invites, state);
                 }
             }
             _ = keepalive.tick() => {
                 if let Err(e) = sink.send(Message::Ping(Bytes::new())).await {
                     return SessionEnd::Lost(e.to_string());
                 }
-            }
-            _ = poll.tick() => {
-                let (addr, me, state, online) = (addr.clone(), me.to_string(), state.clone(), online.clone());
-                tokio::spawn(async move {
-                    if let Ok(users) = users(&addr).await {
-                        let others = users.into_iter().filter(|u| *u != me).collect();
-                        state.set_users(others, &online);
-                    }
-                });
             }
             changed = config_rx.changed() => {
                 if changed.is_err() {
@@ -454,26 +469,48 @@ async fn session(
     }
 }
 
-fn handle_line(line: &str, addr: &RelayAddr, me: &str, online: &OnlineList, invites: &Invites) {
+fn handle_line(
+    line: &str,
+    addr: &RelayAddr,
+    me: &str,
+    online: &OnlineList,
+    invites: &Invites,
+    state: &RelayState,
+) {
+    let parts = extract_brackets(line);
+    if line.starts_with("SESSION") {
+        state.set_session(parts.first().map(|s| s.to_string()));
+        return;
+    }
+    if line.starts_with("USERS") {
+        let others = parts
+            .into_iter()
+            .filter(|name| *name != me)
+            .map(String::from)
+            .collect();
+        state.set_users(others, online);
+        return;
+    }
     if !line.starts_with("INVITE") {
         return;
     }
-    let parts = extract_brackets(line);
-    let (Some(from), Some(Ok(id))) = (parts.first(), parts.get(1).map(|p| p.parse::<u64>())) else {
+    let (Some(from), Some(token), Some(session)) = (parts.first(), parts.get(1), state.session())
+    else {
         return;
     };
     let source = InviteSource::Relay {
         addr: addr.clone(),
-        id,
+        token: token.to_string(),
+        session: session.clone(),
     };
     let origin = format!("relay {}", addr.host);
     let accepted = !is_in_chat() && invites.offer(from.to_string(), origin, source).is_ok();
     if accepted {
         online.touch();
     } else {
-        let (addr, me) = (addr.clone(), me.to_string());
+        let (addr, me, token) = (addr.clone(), me.to_string(), token.to_string());
         tokio::spawn(async move {
-            let _ = decline(&addr, id, &me).await;
+            let _ = decline(&addr, &token, &me, &session).await;
         });
     }
 }

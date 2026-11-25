@@ -183,6 +183,7 @@
     <div class="users-head"><span>Connected to <code id="host"></code></span><span id="updated">Updating…</span></div>
     <ul id="user-list"></ul>
     <div class="empty" id="empty" hidden><strong>No one is online right now</strong>Start the cli-net-comm client and it will show up here.</div>
+    <div class="empty" id="private" hidden><strong id="private-count"></strong>Names stay private. Only people connected with the cli-net-comm client can see who is online.</div>
   </div>
 
   <h2>How it works</h2>
@@ -220,13 +221,16 @@
   }
 
   function render(data) {
-    $("stat-users").textContent = data.users.length;
+    $("stat-users").textContent = data.online;
     $("stat-chats").textContent = data.active_chats;
     $("stat-invites").textContent = data.pending_invites;
     $("stat-uptime").textContent = uptime(data.uptime_secs);
 
     const list = $("user-list");
-    list.replaceChildren(...data.users.map((name) => {
+    const names = Array.isArray(data.users) ? data.users : null;
+    $("private").hidden = names !== null || data.online === 0;
+    $("private-count").textContent = data.online === 1 ? "1 person is online" : data.online + " people are online";
+    list.replaceChildren(...(names || []).map((name) => {
       const li = document.createElement("li");
       const user = document.createElement("span");
       user.className = "user";
@@ -242,7 +246,7 @@
       li.append(user, state);
       return li;
     }));
-    $("empty").hidden = data.users.length > 0;
+    $("empty").hidden = data.online > 0;
   }
 
   function setLive(ok) {

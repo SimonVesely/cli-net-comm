@@ -451,11 +451,12 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
                             set_in_chat(true);
                             let me = app.config.username().to_string();
                             let peer = target.name().to_string();
+                            let session = app.relay_state.session();
                             let task = start_task(&ui_tx, async move {
                                 match target {
                                     Target::Lan(addr, name) => invite_lan(addr, &me, &name).await,
                                     Target::Relay(relay_addr, name) => {
-                                        invite_relay(&relay_addr, &me, &name).await
+                                        invite_relay(&relay_addr, &me, &name, session).await
                                     }
                                 }
                             });
