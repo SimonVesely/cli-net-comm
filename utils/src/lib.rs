@@ -2,19 +2,29 @@ pub mod chat;
 pub mod discovery;
 pub mod relay;
 pub mod tls;
+pub mod trust;
 pub mod ws;
 
 use regex::Regex;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::watch;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    sync::{Semaphore, watch},
+    time::timeout,
+};
 
 pub use chat::{InviteSource, Invites, is_in_chat};
 pub use discovery::{DEFAULT_PORT, OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
 pub use relay::{DEFAULT_RELAY, RelayAddr, RelayState};
 
 pub const DEFAULT_USERNAME: &str = "EMPTY";
+const LISTENER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const LISTENER_MAX_CONNECTIONS: usize = 64;
 
 #[derive(Clone)]
 pub struct Config {
@@ -82,6 +92,9 @@ impl Config {
         if name.contains(['<', '>']) {
             return Err("name can't contain '<' or '>'");
         }
+        if name.chars().any(char::is_control) {
+            return Err("name can't contain control characters");
+        }
         if name.chars().count() > 32 {
             return Err("name can have at most 32 characters");
         }
@@ -113,12 +126,16 @@ pub async fn passive_connection(
         current_config.ipv4_addr, current_config.port
     ))
     .await?;
+    let slots = Arc::new(Semaphore::new(LISTENER_MAX_CONNECTIONS));
 
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((mut socket, addr)) => {
+                        let Ok(permit) = slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
                         let (my_name, my_port, has_name) = {
                             let cfg = config_rx.borrow();
                             (cfg.username.clone(), cfg.port, cfg.has_name())
@@ -127,19 +144,20 @@ pub async fn passive_connection(
                         let invites = invites.clone();
 
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if !has_name {
                                 return;
                             }
                             let mut buffer = vec![0; 1024];
-                            match socket.read(&mut buffer).await {
-                                Ok(n) if n > 0 => {
+                            match timeout(LISTENER_READ_TIMEOUT, socket.read(&mut buffer)).await {
+                                Ok(Ok(n)) if n > 0 => {
                                     let received_message = String::from_utf8_lossy(&buffer[..n]);
 
                                     if let Some((their_name, their_port)) = parse_greeting(&received_message, "HELLO") {
                                         let reply = format!("HI <{my_name}>\n");
                                         let _ = socket.write_all(reply.as_bytes()).await;
                                         let their_addr = SocketAddr::new(addr.ip(), their_port.unwrap_or(my_port));
-                                        online.upsert(their_addr, their_name, false);
+                                        tokio::spawn(discovery::verify_peer(their_addr, their_name, my_name, my_port, online));
                                     } else if received_message.starts_with("INVITE") {
                                         let host_name = extract_brackets(&received_message)
                                             .first()
@@ -159,8 +177,7 @@ pub async fn passive_connection(
                                         }
                                     }
                                 }
-                                Ok(_) => {}
-                                Err(_) => {}
+                                _ => {}
                             }
                         });
                     }

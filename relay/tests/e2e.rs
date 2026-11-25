@@ -13,7 +13,18 @@ use utils::ws::WsBytes;
 
 type Ws = WsBytes<MaybeTlsStream<TcpStream>>;
 
+fn isolated_identity() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        std::env::set_var(
+            "CLI_NET_COMM_HOME",
+            std::env::temp_dir().join("cli-net-comm-relay-tests"),
+        );
+    });
+}
+
 async fn start_with(settings: relay::Settings) -> SocketAddr {
+    isolated_identity();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { relay::serve(listener, settings).await.unwrap() });

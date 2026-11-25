@@ -23,7 +23,8 @@ use crate::{
     discovery::local_ips,
     extract_brackets,
     relay::{self, RelayAddr, RelayError},
-    tls,
+    tls::{self, PeerInfo},
+    trust::{self, Trust},
 };
 
 pub const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -232,8 +233,21 @@ impl Drop for ChatHandle {
 
 pub struct Connected {
     pub peer: String,
-    pub fingerprint: String,
+    pub peer_fingerprint: String,
+    pub safety_code: String,
+    pub trust: Trust,
     pub chat: ChatHandle,
+}
+
+fn connected(peer: String, info: PeerInfo, chat: ChatHandle) -> Connected {
+    let trust = trust::check(&peer, &info.fingerprint);
+    Connected {
+        peer,
+        peer_fingerprint: info.fingerprint,
+        safety_code: info.safety_code,
+        trust,
+        chat,
+    }
 }
 
 async fn read_chat_line<R>(reader: &mut R) -> Result<Option<String>, String>
@@ -313,15 +327,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match result {
-        InviteResult::Accepted(stream, name) => {
-            let (tls, fingerprint) = tls::connect(stream)
+        InviteResult::Accepted(stream, _) => {
+            let (tls, info) = tls::connect(stream)
                 .await
-                .map_err(|e| format!("TLS handshake with {name} failed: {e}"))?;
-            Ok(Connected {
-                peer: name,
-                fingerprint,
-                chat: spawn_chat(tls),
-            })
+                .map_err(|e| format!("TLS handshake with {peer} failed: {e}"))?;
+            Ok(connected(peer.to_string(), info, spawn_chat(tls)))
         }
         InviteResult::Declined => Err(format!("{peer} declined.")),
         InviteResult::Busy => Err(format!("{peer} is busy in another chat.")),
@@ -334,14 +344,10 @@ async fn accept_tls<S>(stream: S, peer: String) -> Result<Connected, String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (tls, fingerprint) = tls::accept(stream)
+    let (tls, info) = tls::accept(stream)
         .await
         .map_err(|e| format!("TLS handshake with {peer} failed: {e}"))?;
-    Ok(Connected {
-        peer,
-        fingerprint,
-        chat: spawn_chat(tls),
-    })
+    Ok(connected(peer, info, spawn_chat(tls)))
 }
 
 pub async fn invite_lan(addr: SocketAddr, my_name: &str, peer: &str) -> Result<Connected, String> {

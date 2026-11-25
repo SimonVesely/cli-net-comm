@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -21,6 +21,7 @@ pub const DEFAULT_PORT: u16 = 52345;
 const LOCAL_PORT_SPAN: u16 = 10;
 pub const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const PEER_TTL: Duration = Duration::from_secs(90);
+const FRESH: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
 const REPLY_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -35,6 +36,7 @@ pub struct Peer {
 #[derive(Clone)]
 pub struct OnlineList {
     peers: Arc<Mutex<HashMap<SocketAddr, Peer>>>,
+    verifying: Arc<Mutex<HashSet<SocketAddr>>>,
     changed: Arc<watch::Sender<u64>>,
 }
 
@@ -43,12 +45,22 @@ impl Default for OnlineList {
         let (tx, _rx) = watch::channel(0);
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
+            verifying: Arc::new(Mutex::new(HashSet::new())),
             changed: Arc::new(tx),
         }
     }
 }
 
 impl OnlineList {
+    fn is_fresh(&self, addr: SocketAddr) -> bool {
+        let key = canonical(addr, &local_ips());
+        self.peers
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|p| p.verified && p.last_seen.elapsed() < FRESH)
+    }
+
     pub fn upsert(&self, addr: SocketAddr, username: String, verified: bool) {
         let key = canonical(addr, &local_ips());
 
@@ -210,6 +222,23 @@ pub async fn scan_lan(config: Config, online: OnlineList) {
         if let Ok(Some((addr, name))) = result {
             online.upsert(addr, name, true);
         }
+    }
+}
+
+pub async fn verify_peer(
+    addr: SocketAddr,
+    claimed: String,
+    my_name: String,
+    my_port: u16,
+    online: OnlineList,
+) {
+    if online.is_fresh(addr) || !online.verifying.lock().unwrap().insert(addr) {
+        return;
+    }
+    let answer = say_hello(addr, &my_name, my_port).await;
+    online.verifying.lock().unwrap().remove(&addr);
+    if answer.as_deref() == Some(claimed.as_str()) {
+        online.upsert(addr, claimed, true);
     }
 }
 

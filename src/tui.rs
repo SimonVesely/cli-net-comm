@@ -23,6 +23,7 @@ use utils::{
         decline_invite, invite_lan, invite_relay, set_in_chat,
     },
     relay::RelayStatus,
+    trust::{self, Trust},
     *,
 };
 
@@ -120,7 +121,9 @@ enum ChatLine {
 
 struct ChatView {
     peer: String,
-    fingerprint: String,
+    peer_fingerprint: String,
+    safety_code: String,
+    trust: Trust,
     chat: ChatHandle,
     lines: Vec<ChatLine>,
     input: TextInput,
@@ -132,13 +135,17 @@ impl ChatView {
     fn new(connected: Connected) -> Self {
         let Connected {
             peer,
-            fingerprint,
+            peer_fingerprint,
+            safety_code,
+            trust,
             chat,
         } = connected;
         Self {
             lines: Vec::new(),
             peer,
-            fingerprint,
+            peer_fingerprint,
+            safety_code,
+            trust,
             chat,
             input: TextInput::default(),
             scroll_up: 0,
@@ -161,9 +168,24 @@ impl ChatView {
         }
     }
 
+    fn blocked(&self) -> bool {
+        self.ended || matches!(self.trust, Trust::Changed { .. })
+    }
+
+    fn trust_new_key(&mut self) {
+        if matches!(self.trust, Trust::Changed { .. }) {
+            let saved = trust::remember(&self.peer, &self.peer_fingerprint);
+            self.trust = Trust::Known;
+            self.lines.push(ChatLine::System(match saved {
+                Ok(()) => format!("You trusted {}'s new key.", self.peer),
+                Err(e) => format!("Trusted for this chat, but saving failed: {e}"),
+            }));
+        }
+    }
+
     fn send(&mut self) {
         let text = self.input.value().trim().to_string();
-        if text.is_empty() || self.ended {
+        if text.is_empty() || self.blocked() {
             return;
         }
         if text.len() > MAX_MESSAGE_BYTES - 8 {
@@ -479,10 +501,15 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result
             }
             Screen::Chat(view) => match key.code {
                 KeyCode::Esc => back_to_main(&mut screen),
+                KeyCode::Char('t')
+                    if matches!(view.trust, Trust::Changed { .. }) && !view.ended =>
+                {
+                    view.trust_new_key();
+                }
                 KeyCode::Enter => view.send(),
                 KeyCode::PageUp => view.scroll_up = view.scroll_up.saturating_add(5),
                 KeyCode::PageDown => view.scroll_up = view.scroll_up.saturating_sub(5),
-                _ if !view.ended => {
+                _ if !view.blocked() => {
                     view.input.handle_key(key);
                 }
                 _ => {}
@@ -648,31 +675,58 @@ fn draw_waiting(frame: &mut Frame, waiting: &Waiting) {
     );
 }
 
+fn short_fp(fp: &str) -> String {
+    fp.split('-').take(4).collect::<Vec<_>>().join("-")
+}
+
 fn draw_chat(frame: &mut Frame, view: &ChatView) {
     let [header, body, input, help] = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(4),
         Constraint::Min(3),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
     .areas(frame.area());
 
+    let changed = matches!(view.trust, Trust::Changed { .. });
     let head = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(if changed { ERR } else { ACCENT }))
         .title(
             Line::from(format!(" Chat with {} ", view.peer))
                 .fg(LAVENDER)
                 .bold(),
         );
+    let code_line = Line::from(vec![
+        Span::from(" TLS 1.3 ").fg(Color::Black).bg(OK).bold(),
+        Span::from("  safety code ").fg(MUTED),
+        Span::from(view.safety_code.clone()).fg(LAVENDER).bold(),
+        Span::from(format!("  · must be the same on {}'s screen", view.peer)).fg(MUTED),
+    ]);
+    let key = short_fp(&view.peer_fingerprint);
+    let trust_line = match &view.trust {
+        Trust::Known => Line::from(vec![
+            Span::from(" ✓ known key ").fg(OK).bold(),
+            Span::from(format!(" {key} matches the one you saved")).fg(MUTED),
+        ]),
+        Trust::New => Line::from(vec![
+            Span::from(" ● new contact ").fg(WARN).bold(),
+            Span::from(format!(" key {key} saved · compare the safety code once")).fg(MUTED),
+        ]),
+        Trust::Changed { previous } => Line::from(vec![
+            Span::from(" ✗ KEY CHANGED ")
+                .fg(Color::White)
+                .bg(ERR)
+                .bold(),
+            Span::from(format!(
+                " was {} now {key} · possible man in the middle",
+                short_fp(previous)
+            ))
+            .fg(ERR),
+        ]),
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::from(" TLS 1.3 ").fg(Color::Black).bg(OK).bold(),
-            Span::from("  fingerprint ").fg(MUTED),
-            Span::from(view.fingerprint.clone()).bold(),
-            Span::from("").fg(MUTED),
-        ]))
-        .block(head),
+        Paragraph::new(vec![code_line, trust_line]).block(head),
         header,
     );
 
@@ -707,15 +761,32 @@ fn draw_chat(frame: &mut Frame, view: &ChatView) {
                 .block(field("message", false)),
             input,
         );
+    } else if changed {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::from("Compare the safety code with them first. ").fg(ERR),
+                Span::from("t").fg(ACCENT).bold(),
+                Span::from(" trust the new key · ").fg(MUTED),
+                Span::from("Esc").fg(ACCENT).bold(),
+                Span::from(" leave").fg(MUTED),
+            ]))
+            .block(field("sending is blocked", false)),
+            input,
+        );
     } else {
         view.input
             .render(frame, input, field("message", true), true);
     }
-    draw_help(
-        frame,
-        help,
-        vec![("Enter", "send"), ("PgUp/PgDn", "scroll"), ("Esc", "leave")],
-    );
+    let keys = if changed && !view.ended {
+        vec![
+            ("t", "trust new key"),
+            ("PgUp/PgDn", "scroll"),
+            ("Esc", "leave"),
+        ]
+    } else {
+        vec![("Enter", "send"), ("PgUp/PgDn", "scroll"), ("Esc", "leave")]
+    };
+    draw_help(frame, help, keys);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
