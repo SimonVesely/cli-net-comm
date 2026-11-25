@@ -5,26 +5,16 @@ pub mod tls;
 pub mod ws;
 
 use regex::Regex;
-use std::{
-    io::Write,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-pub use chat::{InviteSource, Invites, active_connection, handle_pending_invite, is_in_chat};
+pub use chat::{InviteSource, Invites, is_in_chat};
 pub use discovery::{DEFAULT_PORT, OnlineList, SCAN_INTERVAL, parse_greeting, scan_lan};
 pub use relay::{DEFAULT_RELAY, RelayAddr, RelayState};
 
 pub const DEFAULT_USERNAME: &str = "EMPTY";
-
-pub static ON_MAIN_SCREEN: AtomicBool = AtomicBool::new(false);
-static SCREEN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 pub struct Config {
@@ -109,191 +99,6 @@ impl Config {
 
     pub fn set_relay(&mut self, relay: Option<RelayAddr>) {
         self.relay = relay;
-    }
-}
-
-pub fn display_status(
-    config: &Config,
-    online: &OnlineList,
-    invites: &Invites,
-    relay: &RelayState,
-) -> () {
-    let _guard = SCREEN_LOCK.lock().unwrap();
-
-    println!(
-        "\0\x1b[2J\x1b[H
-        ▜ ▘      ▗        ▌                 ▘    ▗
-      ▛▘▐ ▌▄▖▛▌█▌▜▘▌▌▌▛▌▛▘▙▘▄▖▛▘▛▌▛▛▌▛▛▌▌▌▛▌▌▛▘▀▌▜▘▛▌▛▘
-      ▙▖▐▖▌  ▌▌▙▖▐▖▚▚▘▙▌▌ ▛▖  ▙▖▙▌▌▌▌▌▌▌▙▌▌▌▌▙▖█▌▐▖▙▌▌
-
-                                                                "
-    );
-    println!("Your are now signed in as: {}", config.username);
-    println!("Your setup configuration: ");
-    println!(
-        "IP: {:>6}  {}",
-        config.ipv4_addr,
-        bind_label(&config.ipv4_addr)
-    );
-    println!("Port: {:>6}", config.port);
-
-    let peers = online.snapshot();
-    println!();
-    println!(
-        "── Online users ({}) ─────────────────────────",
-        peers.len()
-    );
-    if peers.is_empty() {
-        println!("   nobody found yet (press r to scan)");
-    }
-    for (addr, peer) in &peers {
-        println!(
-            "   ● {:<16} {:<21}  seen {}s ago",
-            peer.username,
-            addr,
-            peer.last_seen.elapsed().as_secs()
-        );
-    }
-    println!("───────────────────────────────────────────────");
-    match &config.relay {
-        Some(addr) => {
-            let users = relay.users();
-            println!();
-            println!("── Relay {addr} — {}", relay.status());
-            if users.is_empty() {
-                println!("   nobody else online on relay");
-            }
-            for name in &users {
-                println!("   ● {name}");
-            }
-            println!("───────────────────────────────────────────────");
-        }
-        None => println!("Relay: off"),
-    }
-    if let Some((from, addr)) = invites.peek() {
-        println!();
-        println!("   >>> Chat invite from {from} ({addr})  —  a -> accept, d -> decline");
-    }
-    println!();
-    println!("1 -> Edit name   2 -> Network setup   3 -> Connect");
-    println!("r -> Refresh / scan LAN                q -> Quit");
-    print!("> ");
-    std::io::stdout()
-        .flush()
-        .expect("Should flush terminal screen.");
-}
-
-pub fn return_input() -> String {
-    let mut input: String = String::new();
-
-    std::io::stdin()
-        .read_line(&mut input)
-        .expect("Should read user input.");
-
-    input
-}
-
-pub fn edit_name(config: &mut Config) -> () {
-    loop {
-        println!("\0\x1b[2J\x1b[HCurrent name: {}", config.username);
-        println!("Enter new name (empty = keep current): ");
-        let input = return_input();
-        let name = input.trim();
-
-        if name.is_empty() {
-            return;
-        }
-        if name.contains('<') || name.contains('>') {
-            println!("Name can't contain '<' or '>'. Press Enter to try again.");
-            return_input();
-            continue;
-        }
-        config.username = name.to_string();
-        return;
-    }
-}
-
-pub fn network_setup(config: &mut Config) -> () {
-    'setup: loop {
-        println!("\0\x1b[2J\x1b[HActual IP and Port configuration: ");
-        println!("IP: {:>6}", config.ipv4_addr);
-        println!("Port: {:>6}", config.port);
-        println!("Relay: {}", relay_label(config));
-        std::io::stdout()
-            .flush()
-            .expect("Should flush terminal screen.");
-        println!("Want to change interface: 1");
-        println!("Want to change port: 2");
-        println!("Want to change relay server: 3");
-        println!("Back to main screen: 4");
-
-        let input = match return_input().trim().parse::<u8>() {
-            Ok(val) => val,
-            Err(_) => continue 'setup,
-        };
-
-        match input {
-            1 => 'ip_addr: loop {
-                println!("\0\x1b[2J\x1b[HChoose different network interface: ");
-                for (index, ip) in config.bind_options.iter().enumerate() {
-                    println!("{} -> {} {}", index + 1, ip, bind_label(ip));
-                }
-                let new_addr: u8 = match return_input().trim().parse::<u8>() {
-                    Ok(val) => val,
-                    Err(_) => continue 'ip_addr,
-                };
-                match new_addr as usize {
-                    choice if choice <= config.bind_options.len() && choice != 0 => {
-                        config.ipv4_addr = config.bind_options[choice - 1];
-
-                        break;
-                    }
-                    _ => println!("Invalid choice (1-{} available)", config.bind_options.len()),
-                }
-                continue 'setup;
-            },
-            2 => 'port: loop {
-                println!("\0\x1b[2J\x1b[HChoose different port: ");
-                let new_port: u16 = match return_input().trim().parse::<u16>() {
-                    Ok(val) => val,
-                    Err(_) => continue 'port,
-                };
-                config.port = new_port;
-                continue 'setup;
-            },
-            3 => 'relay: loop {
-                println!("\0\x1b[2J\x1b[HCurrent relay: {}", relay_label(config));
-                println!(
-                    "Enter relay URL (e.g. {DEFAULT_RELAY}), '-' to turn relay off, empty to keep: "
-                );
-                let input = return_input();
-                match input.trim() {
-                    "" => continue 'setup,
-                    "-" => {
-                        config.relay = None;
-                        continue 'setup;
-                    }
-                    url => match RelayAddr::parse(url) {
-                        Some(addr) => {
-                            config.relay = Some(addr);
-                            continue 'setup;
-                        }
-                        None => {
-                            println!("Invalid URL. Press Enter to try again.");
-                            return_input();
-                            continue 'relay;
-                        }
-                    },
-                }
-            },
-            4 => {
-                print!("Exiting network setup");
-                return ();
-            }
-            _ => {
-                println!("Invalid choice (1-4 available)");
-            }
-        }
     }
 }
 
@@ -383,31 +188,6 @@ pub async fn passive_connection(
         }
     }
     Ok(())
-}
-
-pub fn set_on_main_screen(value: bool) {
-    ON_MAIN_SCREEN.store(value, Ordering::SeqCst);
-}
-
-pub fn is_on_main_screen() -> bool {
-    ON_MAIN_SCREEN.load(Ordering::SeqCst)
-}
-
-fn relay_label(config: &Config) -> String {
-    config
-        .relay
-        .as_ref()
-        .map_or_else(|| "off".to_string(), |addr| addr.to_string())
-}
-
-fn bind_label(ip: &IpAddr) -> &'static str {
-    if ip.is_unspecified() {
-        "(all interfaces)"
-    } else if ip.is_loopback() {
-        "(loopback - this machine only)"
-    } else {
-        ""
-    }
 }
 
 fn extract_brackets(text: &str) -> Vec<&str> {

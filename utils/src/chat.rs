@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io,
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -9,20 +9,25 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
     net::TcpStream,
+    sync::mpsc,
+    task::JoinHandle,
     time::timeout,
 };
 
 use crate::{
-    Config, OnlineList,
     discovery::local_ips,
     extract_brackets,
-    relay::{self, RelayAddr, RelayError, RelayState},
-    return_input, tls,
+    relay::{self, RelayAddr, RelayError},
+    tls,
 };
 
 pub const INVITE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const MAX_MESSAGE_BYTES: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 static IN_CHAT: AtomicBool = AtomicBool::new(false);
@@ -31,7 +36,7 @@ pub fn is_in_chat() -> bool {
     IN_CHAT.load(Ordering::SeqCst)
 }
 
-fn set_in_chat(value: bool) {
+pub fn set_in_chat(value: bool) {
     IN_CHAT.store(value, Ordering::SeqCst);
 }
 
@@ -190,211 +195,185 @@ where
     Some(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
-fn read_line_blocking() -> String {
-    tokio::task::block_in_place(return_input)
+pub enum ChatEvent {
+    Message(String),
+    Closed(Option<String>),
 }
 
-fn flush() {
-    let _ = std::io::stdout().flush();
+pub struct ChatHandle {
+    outgoing: mpsc::UnboundedSender<String>,
+    events: mpsc::UnboundedReceiver<ChatEvent>,
+    reader: JoinHandle<()>,
 }
 
-fn pause(msg: &str) {
-    println!("{msg} Press Enter to go back.");
-    read_line_blocking();
+impl ChatHandle {
+    pub fn send(&self, text: &str) -> bool {
+        self.outgoing.send(text.to_string()).is_ok()
+    }
+
+    pub fn try_event(&mut self) -> Option<ChatEvent> {
+        self.events.try_recv().ok()
+    }
 }
 
-pub async fn chat_session<S>(stream: S, peer: String, fingerprint: String)
+impl Drop for ChatHandle {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+pub struct Connected {
+    pub peer: String,
+    pub fingerprint: String,
+    pub chat: ChatHandle,
+}
+
+async fn read_chat_line<R>(reader: &mut R) -> Result<Option<String>, String>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let read = (&mut *reader)
+        .take(MAX_MESSAGE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut buf)
+        .await;
+    match read {
+        Ok(0) => Ok(None),
+        Ok(_) if buf.last() == Some(&b'\n') => Ok(Some(
+            String::from_utf8_lossy(&buf)
+                .trim_end_matches(['\r', '\n'])
+                .to_string(),
+        )),
+        Ok(_) if buf.len() > MAX_MESSAGE_BYTES => {
+            Err("peer sent a message that is too long".into())
+        }
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub fn spawn_chat<S>(stream: S) -> ChatHandle
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    set_in_chat(true);
-    print!("\x1b[2J\x1b[H");
-    println!("── Chat with {peer} ── (TLS 1.3, type /quit to leave)");
-    println!("Fingerprint: {fingerprint}\n");
-
     let (rd, mut wr) = tokio::io::split(stream);
-    let peer_gone = Arc::new(AtomicBool::new(false));
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
 
-    let reader = {
-        let peer = peer.clone();
-        let peer_gone = peer_gone.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(rd).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(text) = line.strip_prefix("MSG ") {
-                    print!("\r\x1b[2K{peer}: {text}\n> ");
-                    flush();
-                } else if line == "BYE" {
-                    break;
-                }
+    let reader = tokio::spawn(async move {
+        let mut reader = BufReader::new(rd);
+        loop {
+            let event = match read_chat_line(&mut reader).await {
+                Ok(Some(line)) => match line.strip_prefix("MSG ") {
+                    Some(text) => ChatEvent::Message(text.to_string()),
+                    None if line == "BYE" => ChatEvent::Closed(None),
+                    None => continue,
+                },
+                Ok(None) => ChatEvent::Closed(None),
+                Err(e) => ChatEvent::Closed(Some(e)),
+            };
+            let closed = matches!(event, ChatEvent::Closed(_));
+            if ev_tx.send(event).is_err() || closed {
+                return;
             }
-            peer_gone.store(true, Ordering::SeqCst);
-            print!("\r\x1b[2K[{peer} left the chat — press Enter]\n");
-            flush();
-        })
-    };
+        }
+    });
 
-    loop {
-        print!("> ");
-        flush();
-        let input = read_line_blocking();
-        if peer_gone.load(Ordering::SeqCst) {
-            break;
+    tokio::spawn(async move {
+        while let Some(text) = out_rx.recv().await {
+            let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+            let sent = wr.write_all(format!("MSG {clean}\n").as_bytes()).await;
+            if sent.is_err() || wr.flush().await.is_err() {
+                return;
+            }
         }
-        let text = input.trim_end_matches(['\r', '\n']);
-        if text == "/quit" {
-            let _ = wr.write_all(b"BYE\n").await;
-            let _ = wr.flush().await;
-            break;
-        }
-        if text.trim().is_empty() {
-            continue;
-        }
-        print!("\x1b[1A\r\x1b[2Kyou: {text}\n");
-        let sent = wr.write_all(format!("MSG {text}\n").as_bytes()).await;
-        if sent.is_err() || wr.flush().await.is_err() {
-            println!("[connection lost — press Enter]");
-            read_line_blocking();
-            break;
-        }
+        let _ = wr.write_all(b"BYE\n").await;
+        let _ = wr.flush().await;
+        let _ = wr.shutdown().await;
+    });
+
+    ChatHandle {
+        outgoing: out_tx,
+        events: ev_rx,
+        reader,
     }
-
-    let _ = wr.shutdown().await;
-    reader.abort();
-    set_in_chat(false);
 }
 
-async fn finish_invite<S>(result: InviteResult<S>, peer: &str)
+async fn finish_invite<S>(result: InviteResult<S>, peer: &str) -> Result<Connected, String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let msg = match result {
-        InviteResult::Accepted(stream, name) => match tls::connect(stream).await {
-            Ok((tls, fingerprint)) => return chat_session(tls, name, fingerprint).await,
-            Err(e) => format!("TLS handshake with {name} failed: {e}."),
-        },
-        InviteResult::Declined => format!("{peer} declined."),
-        InviteResult::Busy => format!("{peer} is busy in another chat."),
-        InviteResult::NoAnswer => format!("{peer} didn't answer."),
-        InviteResult::Unreachable(e) => format!("Couldn't reach {peer}: {e}."),
-    };
-    pause(&msg);
+    match result {
+        InviteResult::Accepted(stream, name) => {
+            let (tls, fingerprint) = tls::connect(stream)
+                .await
+                .map_err(|e| format!("TLS handshake with {name} failed: {e}"))?;
+            Ok(Connected {
+                peer: name,
+                fingerprint,
+                chat: spawn_chat(tls),
+            })
+        }
+        InviteResult::Declined => Err(format!("{peer} declined.")),
+        InviteResult::Busy => Err(format!("{peer} is busy in another chat.")),
+        InviteResult::NoAnswer => Err(format!("{peer} didn't answer.")),
+        InviteResult::Unreachable(e) => Err(format!("Couldn't reach {peer}: {e}.")),
+    }
 }
 
-async fn accept_and_chat<S>(stream: S, peer: String)
+async fn accept_tls<S>(stream: S, peer: String) -> Result<Connected, String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    match tls::accept(stream).await {
-        Ok((tls, fingerprint)) => chat_session(tls, peer, fingerprint).await,
-        Err(e) => {
-            print!("\x1b[2J\x1b[H");
-            pause(&format!("TLS handshake with {peer} failed: {e}."));
-        }
-    }
+    let (tls, fingerprint) = tls::accept(stream)
+        .await
+        .map_err(|e| format!("TLS handshake with {peer} failed: {e}"))?;
+    Ok(Connected {
+        peer,
+        fingerprint,
+        chat: spawn_chat(tls),
+    })
 }
 
-enum Target {
-    Lan(SocketAddr, String),
-    Relay(RelayAddr, String),
+pub async fn invite_lan(addr: SocketAddr, my_name: &str, peer: &str) -> Result<Connected, String> {
+    finish_invite(invite_with_fallback(addr, my_name).await, peer).await
 }
 
-pub async fn active_connection(config: &Config, online: &OnlineList, relay_state: &RelayState) {
-    let mut targets: Vec<Target> = online
-        .snapshot()
-        .into_iter()
-        .map(|(addr, peer)| Target::Lan(addr, peer.username))
-        .collect();
-    if let Some(relay_addr) = &config.relay {
-        targets.extend(
-            relay_state
-                .users()
-                .into_iter()
-                .map(|name| Target::Relay(relay_addr.clone(), name)),
-        );
-    }
-
-    print!("\x1b[2J\x1b[H");
-    if targets.is_empty() {
-        pause("Nobody online yet.");
-        return;
-    }
-
-    println!("Who do you want to chat with? (Enter = back)\n");
-    for (i, target) in targets.iter().enumerate() {
-        match target {
-            Target::Lan(addr, name) => println!("{} -> {:<16} {}", i + 1, name, addr),
-            Target::Relay(_, name) => println!("{} -> {:<16} [relay]", i + 1, name),
-        }
-    }
-    print!("\n> ");
-    flush();
-
-    let choice = match read_line_blocking().trim().parse::<usize>() {
-        Ok(n) if (1..=targets.len()).contains(&n) => n,
-        _ => return,
-    };
-
-    set_in_chat(true);
-    match &targets[choice - 1] {
-        Target::Lan(addr, name) => {
-            println!(
-                "Inviting {name} at {addr}… waiting up to {}s for them to accept.",
-                INVITE_TIMEOUT.as_secs()
-            );
-            flush();
-            let result = invite_with_fallback(*addr, &config.username).await;
-            set_in_chat(false);
-            finish_invite(result, name).await;
-        }
-        Target::Relay(relay_addr, name) => {
-            println!(
-                "Inviting {name} via relay… waiting up to {}s for them to accept.",
-                INVITE_TIMEOUT.as_secs()
-            );
-            flush();
-            let result = invite_via_relay(relay_addr, &config.username, name).await;
-            set_in_chat(false);
-            finish_invite(result, name).await;
-        }
-    }
+pub async fn invite_relay(
+    relay_addr: &RelayAddr,
+    my_name: &str,
+    peer: &str,
+) -> Result<Connected, String> {
+    finish_invite(invite_via_relay(relay_addr, my_name, peer).await, peer).await
 }
 
-pub async fn handle_pending_invite(config: &Config, invites: &Invites, accept: bool) {
-    let Some(invite) = invites.take() else {
-        return;
-    };
+pub async fn accept_invite(invite: PendingInvite, my_name: &str) -> Result<Connected, String> {
     let PendingInvite { from, source, .. } = invite;
-
     match source {
         InviteSource::Lan(mut stream) => {
-            let reply = if accept {
-                format!("ACCEPT <{}>\n", config.username)
-            } else {
-                "DECLINE\n".to_string()
-            };
-            let sent = stream.write_all(reply.as_bytes()).await.is_ok();
-            if accept && sent {
-                accept_and_chat(stream, from).await;
-            } else if accept {
-                print!("\x1b[2J\x1b[H");
-                pause("The invite expired.");
-            }
-        }
-        InviteSource::Relay { addr, id } if accept => {
-            print!("\x1b[2J\x1b[H");
-            println!("Joining {from} via relay…");
-            flush();
-            match relay::join(&addr, id, &config.username).await {
-                Ok(stream) => accept_and_chat(stream, from).await,
-                Err(e) => pause(&format!("Couldn't join {from}: {e}.")),
-            }
+            stream
+                .write_all(format!("ACCEPT <{my_name}>\n").as_bytes())
+                .await
+                .map_err(|_| "The invite expired.".to_string())?;
+            accept_tls(stream, from).await
         }
         InviteSource::Relay { addr, id } => {
-            let name = config.username.clone();
-            tokio::spawn(async move {
-                let _ = relay::decline(&addr, id, &name).await;
-            });
+            let stream = relay::join(&addr, id, my_name)
+                .await
+                .map_err(|e| format!("Couldn't join {from}: {e}."))?;
+            accept_tls(stream, from).await
+        }
+    }
+}
+
+pub async fn decline_invite(invite: PendingInvite, my_name: &str) {
+    match invite.source {
+        InviteSource::Lan(mut stream) => {
+            let _ = stream.write_all(b"DECLINE\n").await;
+        }
+        InviteSource::Relay { addr, id } => {
+            let _ = relay::decline(&addr, id, my_name).await;
         }
     }
 }
